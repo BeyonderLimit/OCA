@@ -134,8 +134,35 @@ pub enum Command {
         cmd: SnapshotCommand,
     },
 
+    /// Runtime packs: side-load and inspect the llama.cpp runtime (Phase 7,
+    /// fully offline — packs are local files).
+    Runtime {
+        #[command(subcommand)]
+        cmd: RuntimeCommand,
+    },
+
     /// Report the health of each OCA subsystem (warnings are informational; exit 0).
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuntimeCommand {
+    /// Install a runtime pack from a local file (SHA-256 manifest verified
+    /// before anything is placed under the runtime directory).
+    Install {
+        /// The pack file (`.tar.gz`) to install.
+        #[arg(long)]
+        from: PathBuf,
+        /// Runtime directory (default `~/.oca/runtime`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// List installed runtime packs and their verification status.
+    List {
+        /// Runtime directory (default `~/.oca/runtime`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

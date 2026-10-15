@@ -56,7 +56,7 @@ fn run() -> anyhow::Result<u8> {
             project_dir.as_deref(),
             home.as_deref(),
         )),
-        Some(cmd) => commands::dispatch(cmd, home.as_deref()),
+        Some(cmd) => commands::dispatch(cmd, home.as_deref(), &cfg),
         None => {
             Cli::command().print_help()?;
             Ok(0)

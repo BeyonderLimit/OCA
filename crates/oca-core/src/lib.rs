@@ -26,6 +26,11 @@ pub use oca_versioning::{
     ChangeKind, DiffReport, FileDiff, RestoreReport, SnapshotInfo, format_time,
 };
 
+mod jobs;
+/// Background jobs (ADR-0006) flow through Core like everything else —
+/// frontends spawn/cancel/query without owning thread logic.
+pub use jobs::{JobCancel, JobContext, JobSnapshot, JobState, Jobs, Priority};
+
 /// Mutations, expressible as data (later: serializable to a GUI wire format).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -136,6 +141,8 @@ pub struct Core {
     listeners: Vec<Listener>,
     /// The snapshot engine (swappable behind `SnapshotStore`).
     store: oca_versioning::GitStore,
+    /// The job registry (ADR-0006): progress, cancel, priority.
+    jobs: Jobs,
 }
 
 impl Core {
@@ -150,6 +157,31 @@ impl Core {
 
     pub fn project(&self) -> Option<&Project> {
         self.project.as_ref()
+    }
+
+    // --- jobs (ADR-0006) -------------------------------------------------
+
+    /// Spawn a background job; see [`Jobs::spawn`].
+    pub fn spawn_job<F>(&self, label: impl Into<String>, priority: Priority, f: F) -> u64
+    where
+        F: FnOnce(&JobContext) -> Result<()> + Send + 'static,
+    {
+        self.jobs.spawn(label, priority, f)
+    }
+
+    /// Signal a job to stop (cooperative). `false` = unknown id.
+    pub fn cancel_job(&self, id: u64) -> bool {
+        self.jobs.cancel(id)
+    }
+
+    /// One job's snapshot, if tracked.
+    pub fn job(&self, id: u64) -> Option<JobSnapshot> {
+        self.jobs.snapshot(id)
+    }
+
+    /// Every tracked job, newest first.
+    pub fn jobs(&self) -> Vec<JobSnapshot> {
+        self.jobs.list()
     }
 
     fn project_mut(&mut self) -> Result<&mut Project> {

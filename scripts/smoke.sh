@@ -12,8 +12,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== phase gate: only this phase's crates exist =="
 # No big-bang scaffolding: crates are created when their phase arrives
-# (crate → phase table, OCA-implementation.md §2). Phases 0–6 = these + CLI.
-allowed="oca-audio oca-cli oca-core oca-markdown oca-model oca-music oca-storage oca-story oca-tui oca-versioning"
+# (crate → phase table, OCA-implementation.md §2). Phases 0–7 = these + CLI.
+allowed="oca-ai oca-audio oca-cli oca-core oca-markdown oca-model oca-music oca-storage oca-story oca-tui oca-versioning"
 for dir in crates/*/; do
     name=$(basename "$dir")
     case " $allowed " in
@@ -25,13 +25,22 @@ for dir in crates/*/; do
     esac
 done
 
-echo "== phase gate: zero AI crates in the dependency tree =="
-# Phases 0–6 must build with no AI anywhere (AGENTS rule 3 — AI optional).
-# oca-music (Phase 3) is deterministic and allowed; the rest arrive later.
+echo "== phase gate: engines stay AI-free; later crates stay absent =="
+# Rule 3 (AI optional): the deterministic engines from Phases 0–6 must not
+# depend on oca-ai at all — deleting every model leaves them untouched.
+# oca-cli/oca-tui are frontends: they hold the optional runtime behind the
+# LanguageModel trait. Crates from later phases must not exist yet.
 deps=$(cargo tree --workspace -e normal,build --prefix none | grep -Eo '^[a-zA-Z0-9_-]+' | sort -u)
-for bad in oca-ai oca-rag oca-eval oca-import oca-export llama whisper; do
+for bad in oca-rag oca-eval oca-import oca-export llama whisper; do
     if printf '%s\n' "$deps" | grep -qx "$bad"; then
         echo "out-of-phase crate '$bad' found in the dependency tree"
+        exit 1
+    fi
+done
+for crate in oca-model oca-markdown oca-storage oca-story oca-music oca-audio oca-versioning oca-core; do
+    if cargo tree -p "$crate" -e normal,build --prefix none \
+        | grep -Eo '^[a-zA-Z0-9_-]+' | sort -u | grep -qx "oca-ai"; then
+        echo "engine crate '$crate' depends on oca-ai — AI must stay optional (rule 3)"
         exit 1
     fi
 done

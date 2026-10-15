@@ -5,7 +5,7 @@
 //! `⚠` details or fail earlier in config loading. Exit code is 0: warnings are
 //! informational until later phases make them real checks.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::logging::Logging;
@@ -14,11 +14,6 @@ pub struct Check {
     pub ok: bool,
     pub label: &'static str,
     pub detail: String,
-}
-
-/// Path a future feature will live at, for stub details.
-fn phase(what: &str, phase: &str) -> String {
-    format!("{what} arrives in {phase}")
 }
 
 pub fn collect(
@@ -141,11 +136,103 @@ pub fn collect(
         }
     });
 
-    checks.push(Check {
-        ok: false,
-        label: "Model runtime",
-        detail: phase("optional AI runtime (llama-server)", "Phase 7"),
+    // Model runtime (Phase 7): discovery only — doctor never spawns it.
+    let runtime_dir = cfg
+        .ai
+        .runtime_dir
+        .clone()
+        .or_else(|| home.map(|h| h.join(".oca").join("runtime")))
+        .unwrap_or_else(oca_ai::default_runtime_dir);
+    let models_dir = cfg
+        .ai
+        .models_dir
+        .clone()
+        .or_else(|| home.map(|h| h.join(".oca").join("models").join("llm")))
+        .unwrap_or_else(oca_ai::default_models_dir);
+    let server: Option<PathBuf> = match &cfg.ai.llama_server {
+        // An explicit config path must exist *as configured* — report the
+        // miss rather than silently using a different runtime.
+        Some(path) if path.is_file() => Some(path.clone()),
+        Some(_) => None,
+        None => oca_ai::find_server_in(&runtime_dir, std::env::var_os("PATH").as_deref()),
+    };
+    let configured_missing = cfg.ai.llama_server.as_ref().is_some_and(|p| !p.is_file());
+    checks.push(match server {
+        Some(path) => Check {
+            ok: true,
+            label: "Model runtime",
+            detail: format!("{} · one heavy model at a time", path.display()),
+        },
+        None if configured_missing => Check {
+            ok: false,
+            label: "Model runtime",
+            detail: format!(
+                "configured path missing: {}",
+                cfg.ai
+                    .llama_server
+                    .as_deref()
+                    .unwrap_or(Path::new(""))
+                    .display()
+            ),
+        },
+        None => Check {
+            ok: false,
+            label: "Model runtime",
+            detail: "not installed — side-load with `oca runtime install --from <pack.tar.gz>`"
+                .into(),
+        },
     });
+
+    // Installed LLM models (~/.oca/models/llm, largest first).
+    checks.push(match oca_ai::discover_models(&models_dir) {
+        Ok(models) if models.is_empty() => Check {
+            ok: false,
+            label: "Models",
+            detail: format!(
+                "no model in {} — drop a .gguf file in",
+                models_dir.display()
+            ),
+        },
+        Ok(models) => {
+            let mut shown: Vec<String> = models
+                .iter()
+                .take(3)
+                .map(|m| format!("{} ({})", m.name, oca_ai::human_size(m.bytes)))
+                .collect();
+            if models.len() > 3 {
+                shown.push(format!("+{} more", models.len() - 3));
+            }
+            Check {
+                ok: true,
+                label: "Models",
+                detail: format!("{} — {}", models_dir.display(), shown.join(", ")),
+            }
+        }
+        Err(err) => Check {
+            ok: false,
+            label: "Models",
+            detail: format!("models directory unreadable ({err:#})"),
+        },
+    });
+
+    // Hardware tier recommendation (ADR-0008): tiers, not model names.
+    {
+        let hw = oca_ai::Hardware::detect();
+        let detail = match hw.tier() {
+            Some(tier) => format!(
+                "{} GB RAM × {} cores → {}",
+                hw.ram_gb(),
+                hw.cores,
+                tier.describe()
+            ),
+            None => format!("RAM unknown × {} cores", hw.cores),
+        };
+        checks.push(Check {
+            ok: true,
+            label: "Hardware",
+            detail,
+        });
+    }
 
     // Embeddings: a real check today — presence of `~/.oca/models/embeddings/`.
     let embeddings = home.map(|h| h.join(".oca").join("models").join("embeddings"));
@@ -244,6 +331,63 @@ mod tests {
         let checks = collect(&Config::default(), &logging_ok(), None, Some(tmp.path()));
         let emb = checks.iter().find(|c| c.label == "Embeddings").unwrap();
         assert!(emb.ok);
+    }
+
+    fn cfg_with_runtime(path: &std::path::Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.ai.llama_server = Some(path.to_path_buf());
+        cfg
+    }
+
+    #[test]
+    fn ai_checks_report_missing_runtime_models_and_hardware() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-llama-server");
+        let cfg = cfg_with_runtime(&missing);
+        let checks = collect(&cfg, &logging_ok(), None, Some(tmp.path()));
+
+        let runtime = checks.iter().find(|c| c.label == "Model runtime").unwrap();
+        assert!(!runtime.ok);
+        assert!(
+            runtime.detail.contains("configured path missing"),
+            "{}",
+            runtime.detail
+        );
+
+        let models = checks.iter().find(|c| c.label == "Models").unwrap();
+        assert!(!models.ok);
+        assert!(models.detail.contains("drop a .gguf"), "{}", models.detail);
+
+        let hw = checks.iter().find(|c| c.label == "Hardware").unwrap();
+        assert!(hw.ok);
+        assert!(hw.detail.contains("cores"), "{}", hw.detail);
+    }
+
+    #[test]
+    fn ai_checks_pass_with_runtime_and_model() {
+        let tmp = TempDir::new().unwrap();
+        // A stand-in runtime binary and one discovered model.
+        let server = tmp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\n").unwrap();
+        let models = tmp.path().join(".oca").join("models").join("llm");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("lyra-3b.gguf"), vec![0u8; 2048]).unwrap();
+
+        let cfg = cfg_with_runtime(&server);
+        let checks = collect(&cfg, &logging_ok(), None, Some(tmp.path()));
+
+        let runtime = checks.iter().find(|c| c.label == "Model runtime").unwrap();
+        assert!(runtime.ok, "{}", runtime.detail);
+        assert!(
+            runtime.detail.contains("one heavy model at a time"),
+            "{}",
+            runtime.detail
+        );
+
+        let models = checks.iter().find(|c| c.label == "Models").unwrap();
+        assert!(models.ok, "{}", models.detail);
+        assert!(models.detail.contains("lyra-3b"), "{}", models.detail);
+        assert!(models.detail.contains("2.0 KB"), "{}", models.detail);
     }
 
     #[test]

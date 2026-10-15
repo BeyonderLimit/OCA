@@ -30,3 +30,4 @@ results such as ADR-0021). Full rationale lives in
 | [0022](0022-audio-takes.md) | Phase 4 | Audio takes: WAV + sidecar, quiet devices |
 | [0023](0023-cache-db-search-units.md) | Phase 5 | Cache DB: one SQLite file, FTS5 units, mtime reconcile |
 | [0024](0024-snapshot-engine.md) | Phase 6 | Snapshot engine: vendored libgit2, checksum-manifest audio |
+| [0025](0025-ai-runtime.md) | Phase 7 | AI runtime: one trait, subprocess llama-server, offline packs |

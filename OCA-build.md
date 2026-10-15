@@ -507,15 +507,25 @@ Shared infrastructure, different evaluators. Each stage emits a proposal; the pi
 ### 7.5 `LanguageModel` abstraction
 
 ```rust
-trait LanguageModel {
-    fn load(&self, model: ModelConfig);
-    fn generate(&self, request: GenerationRequest);   // streaming
-    fn cancel(&self);
-    fn unload(&self);
+trait LanguageModel {                    // every method &self — interior state,
+    fn info(&self) -> ModelInfo;         // so cancel() works from any thread
+    fn is_loaded(&self) -> bool;
+    fn load(&self) -> Result<()>;        // idempotent; config is per-instance
+    fn generate(                         // streaming (Phase 7 form)
+        &self,
+        request: &GenerationRequest,     // prompt/system + optional schema
+        sink: &mut dyn FnMut(&str),      // one token at a time
+    ) -> Result<GenerationOutcome>;      // text + tokens + cancelled flag
+    fn cancel(&self);                    // interrupt the stream, runtime stays up
+    fn unload(&self) -> Result<()>;      // idempotent; releases the process
 }
 ```
 
-Impls: `LlamaCppSubprocess` (first), mock (all tests), future providers. Generation must be interruptible (`[ESC] Stop`).
+Impls: `LlamaCppSubprocess` (first — loopback server, per-session API key,
+kill on unload, clean error on crash), mock (all tests), future providers.
+Generation must be interruptible (`[ESC] Stop`). Runtime packs (`oca runtime
+install --from <pack.tar.gz>`, SHA-256 verified) and the one-heavy-model
+governor live in the same crate (ADR-0025).
 
 ---
 

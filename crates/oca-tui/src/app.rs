@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use oca_ai::Ai;
 use oca_audio::{Audio, AudioHost, Player, RecState, Recorder, Take, default_take_dir};
-use oca_core::{Command, Core, Event, RecoveryEntry};
+use oca_core::{Command, Core, Event, JobState, Priority, RecoveryEntry};
 use oca_model::DocumentKind;
 use oca_music::{CursorMetrics, EnglishPhonetics, Music, cursor_metrics, section_marks};
 use ratatui::Frame;
@@ -40,6 +41,8 @@ enum Focus {
     Search,
     /// The snapshot panel (restore points + inline diff) is open.
     Snapshots,
+    /// The AI panel (runtime status, Load/Unload, streaming probe) is open.
+    Ai,
 }
 
 enum TreeItem {
@@ -147,6 +150,35 @@ enum SnapMode {
     },
 }
 
+/// The AI panel (Phase 7): model info, Load/Unload, and a streaming probe
+/// with `[ESC] Stop`. All runtime logic lives in `oca-ai` + Core's jobs
+/// (rule 8) — this is display and key handling only.
+struct AiPanel {
+    state: AiState,
+    /// Tokens streamed so far by the probe (also drives the progress bar).
+    stream_tokens: usize,
+    /// The assembled probe output.
+    stream_text: String,
+    /// The probe job, while one runs.
+    job: Option<u64>,
+    /// Token channel fed by the probe job thread.
+    rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Last load/probe failure, shown in red until the next action.
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiState {
+    /// Runtime present, model not resident.
+    Idle,
+    /// Load job running.
+    Loading,
+    /// Model resident — probes can start.
+    Ready,
+    /// Probe streaming right now.
+    Streaming,
+}
+
 /// Present while a song's `lyrics.md` is open: the language its lyric tools
 /// run under plus the loaded phonetics. All analysis lives in `oca-music`
 /// (rule 8) — this only caches what the status bar and section jumps need.
@@ -179,6 +211,10 @@ pub struct App {
     search_panel: Option<SearchPanel>,
     /// Present while the snapshot panel is open.
     snap_panel: Option<SnapshotPanel>,
+    /// The AI runtime facade (None = no runtime — AI is optional, rule 3).
+    ai: Option<Ai>,
+    /// Present while the AI panel is open.
+    ai_panel: Option<AiPanel>,
     /// Last pass that reconciled the cache index with external edits.
     last_reconcile: Instant,
     last_journal: Instant,
@@ -216,6 +252,8 @@ impl App {
             audio_panel: None,
             search_panel: None,
             snap_panel: None,
+            ai: None,
+            ai_panel: None,
             last_reconcile: Instant::now(),
             last_journal: Instant::now(),
             quit: false,
@@ -498,8 +536,161 @@ impl App {
         }
     }
 
+    /// Attach the AI runtime built by the frontend (bootstrap lives in the
+    /// CLI; `None` means no runtime or no model — the panel still opens and
+    /// explains how to enable AI).
+    pub fn attach_ai(&mut self, ai: Ai) {
+        self.ai = Some(ai);
+    }
+
+    // ---- AI panel (Phase 7) ----------------------------------------------
+
+    fn open_ai_panel(&mut self) {
+        let state = if self.ai.as_ref().is_some_and(|ai| ai.is_loaded()) {
+            AiState::Ready
+        } else {
+            AiState::Idle
+        };
+        self.ai_panel = Some(AiPanel {
+            state,
+            stream_tokens: 0,
+            stream_text: String::new(),
+            job: None,
+            rx: None,
+            error: None,
+        });
+        self.focus = Focus::Ai;
+        self.status = if self.ai.is_some() {
+            "AI panel — l load, u unload, t probe, Esc close".into()
+        } else {
+            "AI panel — no runtime installed (AI is optional)".into()
+        };
+    }
+
+    fn ai_key(&mut self, core: &mut Core, key: KeyEvent) {
+        let Some(mut panel) = self.ai_panel.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                let was_streaming = panel.state == AiState::Streaming;
+                if was_streaming {
+                    // Interrupt the stream (socket abort) and mark the job.
+                    if let Some(ai) = &self.ai {
+                        ai.cancel();
+                    }
+                    if let Some(job) = panel.job.take() {
+                        core.cancel_job(job);
+                    }
+                    panel.state = AiState::Ready;
+                }
+                self.focus = Focus::Tree;
+                self.status = if was_streaming {
+                    "generation stopped — the model stays loaded".into()
+                } else {
+                    "AI panel closed".into()
+                };
+                return;
+            }
+            KeyCode::Char('l') | KeyCode::Char('L')
+                if matches!(panel.state, AiState::Idle | AiState::Ready) =>
+            {
+                match &self.ai {
+                    Some(ai) => {
+                        let ai = ai.clone();
+                        panel.state = AiState::Loading;
+                        panel.error = None;
+                        panel.job = Some(core.spawn_job(
+                            "load model",
+                            Priority::Interactive,
+                            move |_ctx| ai.load(),
+                        ));
+                        self.status = "loading model…".into();
+                    }
+                    None => {
+                        panel.error = Some("no AI runtime installed — see the hint below".into());
+                    }
+                }
+            }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if matches!(panel.state, AiState::Idle | AiState::Ready) =>
+            {
+                if let Some(ai) = &self.ai {
+                    match ai.unload() {
+                        Ok(()) => {
+                            panel.state = AiState::Idle;
+                            panel.error = None;
+                            self.status = "model unloaded — memory released".into();
+                        }
+                        Err(err) => panel.error = Some(format!("{err:#}")),
+                    }
+                }
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') if panel.state == AiState::Ready => {
+                if let Some(ai) = &self.ai {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let ai = ai.clone();
+                    let request = oca_ai::probe_request();
+                    let job = core.spawn_job("generate (probe)", Priority::Interactive, {
+                        move |_ctx| ai.stream(request, tx).map(|_| ())
+                    });
+                    panel.state = AiState::Streaming;
+                    panel.stream_tokens = 0;
+                    panel.stream_text.clear();
+                    panel.rx = Some(rx);
+                    panel.job = Some(job);
+                    panel.error = None;
+                    self.status = "generating — Esc stops".into();
+                }
+            }
+            _ => {}
+        }
+        self.ai_panel = Some(panel);
+    }
+
+    /// Drain probe tokens and retire finished AI jobs (runs every tick).
+    fn poll_ai(&mut self, core: &mut Core) {
+        let Some(panel) = &mut self.ai_panel else {
+            return;
+        };
+        if let Some(rx) = &panel.rx {
+            for token in rx.try_iter() {
+                panel.stream_text.push_str(&token);
+                panel.stream_tokens += 1;
+            }
+        }
+        let Some(job) = panel.job else {
+            return;
+        };
+        let Some(snapshot) = core.job(job) else {
+            panel.job = None;
+            return;
+        };
+        if snapshot.state.is_running() {
+            return;
+        }
+        panel.job = None;
+        panel.rx = None;
+        match snapshot.state {
+            JobState::Failed(msg) => {
+                panel.error = Some(msg);
+                // A failed probe leaves the model loaded; a failed load
+                // leaves it unloaded.
+                panel.state = if matches!(panel.state, AiState::Loading) {
+                    AiState::Idle
+                } else {
+                    AiState::Ready
+                };
+            }
+            JobState::Cancelled | JobState::Done | JobState::Running => {
+                panel.state = AiState::Ready;
+            }
+        }
+    }
+
     pub fn tick(&mut self, core: &mut Core) -> Result<()> {
         self.journal_now(core, false);
+        self.poll_ai(core);
         // Reconcile the cache index with edits made outside this session
         // (the polling watcher — mtime walk, only changed files reparse).
         // Skip while read-only: the session holding the lock maintains it.
@@ -1019,6 +1210,7 @@ impl App {
             Focus::Audio => self.audio_key(core, key),
             Focus::Search => self.search_key(core, key),
             Focus::Snapshots => self.snap_key(core, key),
+            Focus::Ai => self.ai_key(core, key),
         }
         Ok(())
     }
@@ -1074,6 +1266,7 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_state_form(),
             KeyCode::Char('a') | KeyCode::Char('A') => self.open_audio_panel(core),
             KeyCode::Char('v') | KeyCode::Char('V') => self.open_snap_panel(core),
+            KeyCode::Char('i') | KeyCode::Char('I') => self.open_ai_panel(),
             KeyCode::Tab if self.open_rel.is_some() => {
                 self.focus = Focus::Editor;
             }
@@ -1171,6 +1364,7 @@ impl App {
         self.draw_audio(frame);
         self.draw_search(frame);
         self.draw_snapshots(frame);
+        self.draw_ai(frame);
     }
 
     fn draw_tree(&self, frame: &mut Frame, area: Rect) {
@@ -1307,6 +1501,132 @@ impl App {
                 frame.render_widget(para, inner);
             }
         }
+    }
+
+    /// Centered popup: model info, Load/Unload, and the streaming probe
+    /// (Phase 7, `I` in the tree). Follows the roadmap mock.
+    fn draw_ai(&self, frame: &mut Frame) {
+        let Some(panel) = &self.ai_panel else {
+            return;
+        };
+        let area = centered(frame.area(), 74, 24);
+        let block = Block::default().borders(Borders::ALL).title(" AI Model ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines: Vec<Line> = Vec::new();
+        match &self.ai {
+            Some(ai) => {
+                let info = ai.info();
+                lines.push(Line::styled(
+                    format!("● {} ({})", info.name, info.runtime),
+                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::from(format!("  Context: {}", info.context)));
+                lines.push(Line::from(format!(
+                    "  GPU: {}",
+                    if info.gpu_layers > 0 {
+                        format!("enabled ({} layers)", info.gpu_layers)
+                    } else {
+                        "disabled (CPU)".to_string()
+                    }
+                )));
+                lines.push(Line::from(format!(
+                    "  Threads: {}",
+                    if info.threads == 0 {
+                        "auto".to_string()
+                    } else {
+                        info.threads.to_string()
+                    }
+                )));
+                lines.push(Line::from(format!("  {}", ai.policy())));
+                if let Some(tier) = oca_ai::Hardware::detect().tier() {
+                    lines.push(Line::styled(
+                        format!("  hardware: {}", tier.describe()),
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                lines.push(Line::from(""));
+                match panel.state {
+                    AiState::Idle => lines.push(Line::from("[Load]")),
+                    AiState::Loading => lines.push(Line::styled(
+                        "Loading model…",
+                        Style::new().fg(Color::Yellow),
+                    )),
+                    AiState::Ready => lines.push(Line::from("[t probe]  [Unload]")),
+                    AiState::Streaming => {}
+                }
+                if matches!(panel.state, AiState::Streaming) {
+                    // Roadmap mock: bar + [ESC] Stop.
+                    let budget = 64usize; // probe request's max_tokens
+                    let filled = (panel.stream_tokens * 20 / budget).min(20);
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled("Generating…", Style::new().fg(Color::Yellow)));
+                    lines.push(Line::styled(
+                        format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled)),
+                        Style::new().fg(Color::Cyan),
+                    ));
+                    lines.push(Line::from(format!("{} token(s)", panel.stream_tokens)));
+                    lines.push(Line::styled("  [ESC] Stop", Style::new().fg(Color::Yellow)));
+                } else if !panel.stream_text.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled(
+                        "Last probe output:",
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                    let mut shown = panel.stream_text.chars().take(180).collect::<String>();
+                    if panel.stream_text.chars().count() > 180 {
+                        shown.push('…');
+                    }
+                    lines.push(Line::styled(shown, Style::new().fg(Color::DarkGray)));
+                }
+                if let Some(error) = &panel.error {
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled(
+                        format!("⚠ {error}"),
+                        Style::new().fg(Color::Red),
+                    ));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    "Models in ~/.oca/models/llm:",
+                    Style::new().fg(Color::DarkGray),
+                ));
+                if ai.models().is_empty() {
+                    lines.push(Line::styled(
+                        "  (none discovered)",
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                for model in ai.models().iter().take(3) {
+                    lines.push(Line::from(format!(
+                        "  {} ({})",
+                        model.name,
+                        oca_ai::human_size(model.bytes)
+                    )));
+                }
+            }
+            None => {
+                lines.push(Line::styled(
+                    "● no AI runtime",
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::from("AI is optional — everything works without it."));
+                lines.push(Line::from(""));
+                lines.push(Line::from("To enable:"));
+                lines.push(Line::from(
+                    "  1. side-load a runtime pack: oca runtime install --from <pack.tar.gz>",
+                ));
+                lines.push(Line::from("  2. drop a .gguf model into ~/.oca/models/llm"));
+                lines.push(Line::from("  3. reopen the project, then press l to load"));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "l load · u unload · t probe · Esc close",
+            Style::new().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn draw_form(&self, frame: &mut Frame) {
@@ -1490,7 +1810,7 @@ impl App {
                 " Tab/ Esc tree · Ctrl-F search · Ctrl-S save · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Tree => {
-                " ↑↓ select · Enter open · S state · A audio · V snapshots · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
+                " ↑↓ select · Enter open · S state · A audio · V snapshots · I AI · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Form => " Tab field · Enter apply · Esc cancel",
             Focus::Audio => {
@@ -1498,6 +1818,7 @@ impl App {
             }
             Focus::Search => " type filter · ↑↓ select · Enter open · Esc close",
             Focus::Snapshots => " ↑↓ select · c save now · Enter diff · r restore · Esc close",
+            Focus::Ai => " l load · u unload · t probe · Esc close",
         };
         let line2 = Line::from(Span::styled(hints, Style::new().fg(Color::DarkGray)));
         frame.render_widget(Paragraph::new(vec![line1, line2]), area);
@@ -1593,6 +1914,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oca_ai::LanguageModel;
     use oca_audio::MockHost;
     use oca_core::Event;
     use oca_model::ProjectKind;
@@ -2429,5 +2751,189 @@ hold on to the light
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Search"), "panel title renders");
         assert!(text.contains("chapter"), "hit kind renders");
+    }
+
+    // ---- AI panel (Phase 7) ----------------------------------------------
+
+    fn mock_ai(delay_ms: u64, tokens: &[&str]) -> (Arc<oca_ai::MockModel>, Ai) {
+        let model = Arc::new(
+            oca_ai::MockModel::new()
+                .with_tokens(tokens.iter().map(|t| t.to_string()).collect())
+                .with_delay(delay_ms),
+        );
+        let ai = Ai::new(model.clone(), Vec::new());
+        (model, ai)
+    }
+
+    /// Tick until the panel reaches a condition (or fail loudly).
+    fn settle(app: &mut App, core: &mut Core, ok: impl Fn(&AiPanel) -> bool) {
+        for _ in 0..1_000 {
+            app.tick(core).unwrap();
+            if let Some(panel) = &app.ai_panel
+                && ok(panel)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("AI panel never reached the expected state");
+    }
+
+    #[test]
+    fn i_opens_ai_panel_and_no_runtime_degrades_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        assert_eq!(app.focus, Focus::Ai);
+        let panel = app.ai_panel.as_ref().expect("panel open");
+        assert_eq!(panel.state, AiState::Idle);
+
+        // No runtime attached: loading explains itself instead of crashing.
+        app.on_key(&mut core, key(KeyCode::Char('l'))).unwrap();
+        let panel = app.ai_panel.as_ref().unwrap();
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no AI runtime")),
+            "{:?}",
+            panel.error
+        );
+        assert_eq!(panel.state, AiState::Idle);
+
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.ai_panel.is_none());
+    }
+
+    #[test]
+    fn load_probe_stop_and_unload_with_the_mock() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let (model, ai) = mock_ai(5, &["Once", " upon", " a", " time", "."]);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(ai);
+
+        // Load runs as a job; tick retires it.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('l'))).unwrap();
+        assert_eq!(app.ai_panel.as_ref().unwrap().state, AiState::Loading);
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        assert!(model.is_loaded());
+
+        // Probe streams tokens into the panel on ticks.
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(app.ai_panel.as_ref().unwrap().state, AiState::Streaming);
+        settle(&mut app, &mut core, |p| p.stream_tokens >= 2);
+        {
+            let panel = app.ai_panel.as_ref().unwrap();
+            assert!(
+                panel.stream_text.starts_with("Once upon"),
+                "{}",
+                panel.stream_text
+            );
+        }
+
+        // [ESC] Stop: interrupt, stay loaded, say so.
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.status.contains("generation stopped"), "{}", app.status);
+        assert!(model.is_loaded(), "stop must not unload the model");
+
+        // Unload releases residency.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('u'))).unwrap();
+        assert_eq!(app.ai_panel.as_ref().unwrap().state, AiState::Idle);
+        assert!(!model.is_loaded());
+    }
+
+    #[test]
+    fn probe_crash_is_reported_and_the_app_survives() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let model =
+            Arc::new(oca_ai::MockModel::new().fails_generate("model runtime crashed (simulated)"));
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(Ai::new(model, Vec::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('l'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        settle(&mut app, &mut core, |p| p.error.is_some());
+        let panel = app.ai_panel.as_ref().unwrap();
+        assert_eq!(
+            panel.state,
+            AiState::Ready,
+            "model stays loaded after a failed probe"
+        );
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("crashed")),
+            "{:?}",
+            panel.error
+        );
+        // The app is still fully functional afterwards.
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('v'))).unwrap();
+        assert_eq!(app.focus, Focus::Snapshots);
+    }
+
+    #[test]
+    fn ai_panel_draws_runtime_info_and_streaming_progress() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let (_model, ai) = mock_ai(30, &["a", "b", "c"]);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(ai);
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+
+        let render_text = |app: &mut App, core: &Core| -> String {
+            let backend = TestBackend::new(100, 32);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| app.draw(core, frame))
+                .expect("frame renders");
+            let buffer = terminal.backend().buffer();
+            buffer.content().iter().map(|cell| cell.symbol()).collect()
+        };
+
+        let text = render_text(&mut app, &core);
+        assert!(text.contains("AI Model"), "panel title renders");
+        assert!(text.contains("Context"), "model info renders");
+        assert!(text.contains("[Load]"), "idle state shows Load");
+        assert!(text.contains("one heavy model at a time"), "policy renders");
+
+        // Load + probe, then the streaming block renders.
+        app.on_key(&mut core, key(KeyCode::Char('l'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        let text = render_text(&mut app, &core);
+        assert!(text.contains("Generating"), "streaming state renders");
+        assert!(text.contains("[ESC] Stop"), "stop hint renders");
+    }
+
+    #[test]
+    fn no_runtime_panel_explains_how_to_enable_ai() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw(&core, frame))
+            .expect("frame renders");
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("no AI runtime"), "empty state renders");
+        assert!(text.contains("optional"), "rule 3 messaging renders");
+        assert!(text.contains("oca runtime install"), "hint renders");
     }
 }

@@ -11,14 +11,16 @@ use oca_music::CheckReport;
 use oca_storage::registry::Registry;
 
 use crate::cli::{
-    AudioCommand, ChapterCommand, Command, SnapshotCommand, SongCommand, StoryCommand, TagCommand,
+    AudioCommand, ChapterCommand, Command, RuntimeCommand, SnapshotCommand, SongCommand,
+    StoryCommand, TagCommand,
 };
+use crate::config::Config;
 
-pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
+pub fn dispatch(cmd: Command, home: Option<&Path>, cfg: &Config) -> Result<u8> {
     match cmd {
         Command::New { name, path, kind } => new_project(&name, path.as_deref(), &kind, home),
         Command::List => list_projects(home),
-        Command::Open { project } => open_tui(project.as_deref()),
+        Command::Open { project } => open_tui(project.as_deref(), cfg),
         Command::Chapter { cmd } => chapter(cmd),
         Command::Story { cmd } => story(cmd),
         Command::Song { cmd } => song(cmd),
@@ -34,6 +36,7 @@ pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
         Command::Links { target, project } => links(&target, project.as_deref()),
         Command::Migrate { project } => migrate(project.as_deref()),
         Command::Snapshot { cmd } => snapshot(cmd),
+        Command::Runtime { cmd } => runtime(cmd, home),
         Command::Doctor => unreachable!("doctor is dispatched from main"),
     }
 }
@@ -162,11 +165,70 @@ fn list_projects(home: Option<&Path>) -> Result<u8> {
     Ok(0)
 }
 
-fn open_tui(project: Option<&str>) -> Result<u8> {
+fn open_tui(project: Option<&str>, cfg: &Config) -> Result<u8> {
     let root = resolve_open_arg(project)?;
     let mut core = open_core(&root)?;
-    oca_tui::run(&mut core)?;
+    // AI is optional end-to-end (rule 3): a failed discovery just means no
+    // AI panel data, never a failed launch.
+    let ai = match oca_ai::bootstrap(&cfg.bootstrap_options()) {
+        Ok(ai) => ai,
+        Err(err) => {
+            tracing::warn!("AI runtime discovery failed: {err:#}");
+            None
+        }
+    };
+    oca_tui::run(&mut core, ai)?;
     Ok(0)
+}
+
+/// Runtime packs: install from a local file, list + verify.
+fn runtime(cmd: RuntimeCommand, home: Option<&Path>) -> Result<u8> {
+    let runtime_dir = |dir: Option<PathBuf>| {
+        dir.unwrap_or_else(|| match home {
+            Some(h) => h.join(".oca").join("runtime"),
+            None => oca_ai::default_runtime_dir(),
+        })
+    };
+    match cmd {
+        RuntimeCommand::Install { from, dir } => {
+            let dir = runtime_dir(dir);
+            let outcome = oca_ai::install_pack(&from, &dir)?;
+            println!(
+                "installed {} {} — {} file(s) verified → {}",
+                outcome.name,
+                outcome.version,
+                outcome.files,
+                outcome.dir.display()
+            );
+            Ok(0)
+        }
+        RuntimeCommand::List { dir } => {
+            let dir = runtime_dir(dir);
+            let packs = oca_ai::list_packs(&dir)?;
+            if packs.is_empty() {
+                println!(
+                    "no runtime packs in {} (side-load with `oca runtime install --from <pack.tar.gz>`)",
+                    dir.display()
+                );
+                return Ok(0);
+            }
+            let mut any_problems = false;
+            for pack in &packs {
+                if pack.problems.is_empty() {
+                    println!("✓ {} {} — {}", pack.name, pack.version, pack.dir.display());
+                } else {
+                    any_problems = true;
+                    println!(
+                        "⚠ {} {} — {}",
+                        pack.name,
+                        pack.version,
+                        pack.problems.join("; ")
+                    );
+                }
+            }
+            Ok(u8::from(any_problems))
+        }
+    }
 }
 
 fn chapter(cmd: ChapterCommand) -> Result<u8> {

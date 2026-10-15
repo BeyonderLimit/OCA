@@ -1,0 +1,38 @@
+[package]
+name = "oca-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA AI runtime: LanguageModel trait, llama-server subprocess, model manager, runtime packs"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

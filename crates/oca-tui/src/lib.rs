@@ -40,8 +40,9 @@ impl Drop for TermGuard {
     }
 }
 
-/// Run the interactive editor on an already-open project.
-pub fn run(core: &mut Core) -> Result<()> {
+/// Run the interactive editor on an already-open project. `ai` is the
+/// optional AI runtime facade (rule 3 — `None` keeps every feature working).
+pub fn run(core: &mut Core, ai: Option<oca_ai::Ai>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -54,6 +55,9 @@ pub fn run(core: &mut Core) -> Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new(core, Arc::new(CpalHost));
+    if let Some(ai) = ai {
+        app.attach_ai(ai);
+    }
     loop {
         terminal.draw(|frame| app.draw(core, frame))?;
         if app.should_quit() {

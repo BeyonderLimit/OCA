@@ -22,6 +22,27 @@ pub const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 pub struct FileConfig {
     pub log_level: Option<String>,
     pub log_content: Option<bool>,
+    #[serde(default)]
+    pub ai: AiFileConfig,
+}
+
+/// The `[ai]` layer: runtime paths + model defaults. Everything optional —
+/// with no `[ai]` section at all, discovery uses `~/.oca` conventions.
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AiFileConfig {
+    /// Explicit `llama-server` path (beats runtime-pack/PATH discovery).
+    pub llama_server: Option<PathBuf>,
+    /// Models directory (default `~/.oca/models/llm`).
+    pub models_dir: Option<PathBuf>,
+    /// Runtime-pack directory (default `~/.oca/runtime`).
+    pub runtime_dir: Option<PathBuf>,
+    /// Context window, in tokens.
+    pub context: Option<u32>,
+    /// Layers offloaded to the GPU (0 = CPU).
+    pub gpu_layers: Option<u32>,
+    /// Worker threads (0 = runtime's choice).
+    pub threads: Option<u32>,
 }
 
 /// Fully merged configuration plus which layer files were read (for `doctor`).
@@ -29,6 +50,7 @@ pub struct FileConfig {
 pub struct Config {
     pub log_level: Option<String>,
     pub log_content: bool,
+    pub ai: AiFileConfig,
     pub sources: Vec<PathBuf>,
 }
 
@@ -58,9 +80,30 @@ impl Config {
             if let Some(flag) = layer.log_content {
                 cfg.log_content = flag;
             }
+            // `[ai]` merges field-by-field: a project layer may override
+            // just the context without restating every path.
+            let ai = layer.ai;
+            cfg.ai.llama_server = ai.llama_server.or(cfg.ai.llama_server);
+            cfg.ai.models_dir = ai.models_dir.or(cfg.ai.models_dir);
+            cfg.ai.runtime_dir = ai.runtime_dir.or(cfg.ai.runtime_dir);
+            cfg.ai.context = ai.context.or(cfg.ai.context);
+            cfg.ai.gpu_layers = ai.gpu_layers.or(cfg.ai.gpu_layers);
+            cfg.ai.threads = ai.threads.or(cfg.ai.threads);
             cfg.sources.push(path.to_path_buf());
         }
         Ok(cfg)
+    }
+
+    /// What `oca_ai::bootstrap` needs, from the merged `[ai]` section.
+    pub fn bootstrap_options(&self) -> oca_ai::BootstrapOptions {
+        oca_ai::BootstrapOptions {
+            models_dir: self.ai.models_dir.clone(),
+            runtime_dir: self.ai.runtime_dir.clone(),
+            llama_server: self.ai.llama_server.clone(),
+            context: self.ai.context,
+            gpu_layers: self.ai.gpu_layers,
+            threads: self.ai.threads,
+        }
     }
 
     /// Human-readable source summary for `doctor`.
@@ -177,6 +220,33 @@ mod tests {
         write(&global, "logg_level = \"info\"\n");
         let err = Config::load(Some(&global), None).unwrap_err();
         assert!(format!("{err:#}").contains("logg_level"));
+    }
+
+    #[test]
+    fn ai_section_merges_across_layers() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global.toml");
+        let project = dir.path().join("project.toml");
+        write(
+            &global,
+            "log_level = \"info\"\n\n[ai]\ncontext = 4096\ngpu_layers = 0\nmodels_dir = \"/models\"\n",
+        );
+        write(&project, "[ai]\ngpu_layers = 20\nthreads = 6\n");
+        let cfg = Config::load(Some(&global), Some(&project)).unwrap();
+        assert_eq!(cfg.ai.context, Some(4096));
+        assert_eq!(cfg.ai.gpu_layers, Some(20), "project overrides global");
+        assert_eq!(cfg.ai.threads, Some(6));
+        assert_eq!(cfg.ai.models_dir.as_deref(), Some(Path::new("/models")));
+
+        let opts = cfg.bootstrap_options();
+        assert_eq!(opts.context, Some(4096));
+        assert_eq!(opts.gpu_layers, Some(20));
+
+        // Unknown key inside [ai] is still a hard error.
+        let bad = dir.path().join("bad.toml");
+        write(&bad, "[ai]\ncontext_window = 4096\n");
+        let err = Config::load(Some(&bad), None).unwrap_err();
+        assert!(format!("{err:#}").contains("context_window"));
     }
 
     #[test]

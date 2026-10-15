@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
+oca-ai.workspace = true
 oca-audio.workspace = true
 oca-core.workspace = true
 oca-model.workspace = true

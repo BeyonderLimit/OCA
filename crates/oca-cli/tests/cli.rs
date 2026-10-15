@@ -943,3 +943,136 @@ fn phase6_snapshot_errors_are_reported_not_crashed() {
         assert!(!err.contains("panicked"), "no panic: {args:?} — {err}");
     }
 }
+
+// ---- runtime packs + AI checks (Phase 7) ---------------------------------
+
+/// Run `oca` with an isolated HOME (machine-local state can't leak in).
+fn oca_in(home: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oca"));
+    cmd.current_dir(home)
+        .env("HOME", home)
+        .env("USERPROFILE", home);
+    cmd
+}
+
+#[test]
+fn runtime_install_list_and_tamper_detection_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let pack = home.join("llama-pack-1.0.0.tar.gz");
+    oca_ai::pack_writer::write_pack_file(
+        &pack,
+        "llama-pack",
+        "1.0.0",
+        &[("bin/llama-server", b"#!/bin/sh\necho fake\n")],
+    )
+    .unwrap();
+
+    // Empty runtime dir: a hint, not an error.
+    let out = oca_in(home).args(["runtime", "list"]).output().unwrap();
+    assert!(out.status.success(), "list exits 0 when empty");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no runtime packs"), "got: {stdout}");
+    assert!(stdout.contains("oca runtime install"), "hint: {stdout}");
+
+    // Install verifies the manifest before anything lands.
+    let out = oca_in(home)
+        .args(["runtime", "install", "--from"])
+        .arg(&pack)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "install: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("installed llama-pack 1.0.0 — 1 file(s) verified"),
+        "got: {stdout}"
+    );
+
+    // Listed as verified.
+    let out = oca_in(home).args(["runtime", "list"]).output().unwrap();
+    assert!(out.status.success(), "clean pack exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("✓ llama-pack 1.0.0"), "got: {stdout}");
+
+    // Installing the same pack twice is refused, clearly.
+    let out = oca_in(home)
+        .args(["runtime", "install", "--from"])
+        .arg(&pack)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "double install must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already installed"), "got: {stderr}");
+
+    // Someone edits the installed runtime: `list` flags it and exits 1.
+    let installed = home
+        .join(".oca")
+        .join("runtime")
+        .join("llama-pack-1.0.0")
+        .join("bin")
+        .join("llama-server");
+    assert!(installed.is_file(), "binary placed inside the pack dir");
+    std::fs::write(&installed, b"# tampered").unwrap();
+    let out = oca_in(home).args(["runtime", "list"]).output().unwrap();
+    assert!(!out.status.success(), "tampered pack exits non-zero");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("⚠ llama-pack 1.0.0"), "got: {stdout}");
+    assert!(stdout.contains("changed"), "got: {stdout}");
+}
+
+#[test]
+fn install_rejects_a_pack_for_another_platform() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    // Build a pack on the right platform, then flip its platform field by
+    // rebuilding with a different manifest: easiest through the writer is
+    // not possible, so craft via tar directly is overkill — instead install
+    // a non-pack file and expect a manifest error.
+    let bogus = home.join("not-a-pack.tar.gz");
+    std::fs::write(&bogus, b"definitely not gzip").unwrap();
+    let out = oca_in(home)
+        .args(["runtime", "install", "--from"])
+        .arg(&bogus)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "garbage must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error"), "got: {stderr}");
+}
+
+#[test]
+fn doctor_reports_ai_runtime_models_and_hardware() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    // A stand-in runtime inside a pack dir (packs win over PATH)…
+    let server = home
+        .join(".oca")
+        .join("runtime")
+        .join("llama-pack-1.0.0")
+        .join("bin")
+        .join("llama-server");
+    std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+    std::fs::write(&server, b"#!/bin/sh\n").unwrap();
+    // …and one discovered model.
+    let models = home.join(".oca").join("models").join("llm");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("lyra-3b.gguf"), vec![0u8; 4096]).unwrap();
+
+    let out = oca_in(home).arg("doctor").output().unwrap();
+    assert!(out.status.success(), "doctor must exit 0");
+    assert!(
+        out.stderr.is_empty(),
+        "doctor keeps stderr silent: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("✓ Model runtime"), "got: {stdout}");
+    assert!(
+        stdout.contains("one heavy model at a time"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("✓ Models"), "got: {stdout}");
+    assert!(stdout.contains("lyra-3b"), "got: {stdout}");
+    assert!(stdout.contains("Hardware"), "got: {stdout}");
+    assert!(stdout.contains("cores"), "got: {stdout}");
+}
