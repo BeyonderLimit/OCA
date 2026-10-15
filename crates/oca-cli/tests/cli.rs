@@ -801,3 +801,145 @@ fn phase5_index_errors_are_reported_not_crashed() {
     let out = String::from_utf8_lossy(&out.stdout);
     assert!(out.contains("⚠ Database — no project here"), "got: {out}");
 }
+
+/// Phase 6 exit: create → diff → restore round-trip from the CLI over the
+/// sample project — restore reproduces the exact prior bytes (and removes
+/// files the snapshot predates), audio is kept as recorded, and nothing
+/// user-facing says a Git word (rule 7; the vocabulary scan enforces it).
+#[test]
+fn phase6_exit_snapshot_round_trip_over_sample_novel() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+
+    // No snapshots yet: the list says so, and doctor warns (exit 0, quiet
+    // stderr — the Phase 0 contract still holds).
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["snapshot", "list"]));
+    assert!(out.contains("no snapshots yet"), "got: {out}");
+    let out = run(&home, &root, &["doctor"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("⚠ Snapshots — none yet"),
+        "doctor: {out:?}"
+    );
+
+    // Create with a label.
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["snapshot", "create", "before editing"],
+    ));
+    assert!(out.contains("Snapshot #1"), "got: {out}");
+    assert!(out.contains("before editing"), "got: {out}");
+    assert!(out.contains("file(s)"), "got: {out}");
+
+    // Mutate externally: rewrite a chapter and drop in a stray file.
+    let ch = root.join("manuscript/001-the-arrival.md");
+    let original = std::fs::read(&ch).unwrap();
+    let edited = format!("{}\nA NEW LINE.\n", String::from_utf8_lossy(&original));
+    std::fs::write(&ch, edited.as_bytes()).unwrap();
+    let stray = root.join("manuscript/zz-stray.md");
+    std::fs::write(&stray, b"appeared later\n").unwrap();
+
+    // Diff (snapshot vs working) shows exactly the truth.
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["snapshot", "diff", "1"],
+    ));
+    assert!(out.contains("+A NEW LINE."), "got: {out}");
+    assert!(out.contains("001-the-arrival.md"), "got: {out}");
+    assert!(out.contains("zz-stray.md"), "got: {out}");
+    assert!(out.contains("vs your files now"), "got: {out}");
+
+    // Restore: exact bytes back, stray file gone.
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["snapshot", "restore", "1"],
+    ));
+    assert!(out.contains("restored Snapshot #1"), "got: {out}");
+    assert_eq!(
+        std::fs::read(&ch).unwrap(),
+        original,
+        "restore reproduced the exact bytes"
+    );
+    assert!(!stray.exists(), "files the snapshot predates are removed");
+
+    // The restore auto-snapshotted the broken state first — history grew
+    // by the labeled row #2.
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["snapshot", "list"]));
+    assert!(out.contains("Before restoring snapshot #1"), "got: {out}");
+    assert!(out.contains("2     2026"), "row #2: {out}");
+
+    // Snapshot-to-snapshot diff.
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["snapshot", "diff", "1", "2"],
+    ));
+    assert!(out.contains("Snapshot #1 vs Snapshot #2"), "got: {out}");
+    assert!(out.contains("+A NEW LINE."), "the broken state: {out}");
+
+    // doctor now reports the saved restore points.
+    let out = run(&home, &root, &["doctor"]);
+    assert!(String::from_utf8_lossy(&out.stderr).is_empty());
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("✓ Snapshots — 2 saved"), "got: {out}");
+
+    // Audio: takes are reported, never overwritten.
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0002");
+    stdout_of(&run_in(&home, tmp.path(), &root, &["snapshot", "create"]));
+    let wav = root.join("audio/voice-memo.wav");
+    std::fs::write(&wav, b"RIFFre-recorded-then-restored").unwrap();
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["snapshot", "restore", "3"],
+    ));
+    assert!(out.contains("audio kept as recorded"), "got: {out}");
+    assert!(out.contains("voice-memo.wav"), "names the take: {out}");
+    assert_eq!(
+        std::fs::read(&wav).unwrap(),
+        b"RIFFre-recorded-then-restored",
+        "restore never touches recorded bytes"
+    );
+}
+
+/// Phase 6 error paths: bad snapshot numbers fail with a message, never a
+/// panic; diff/restore outside a project explain themselves.
+#[test]
+fn phase6_snapshot_errors_are_reported_not_crashed() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+
+    let cases: &[&[&str]] = &[
+        &["snapshot", "restore", "99"],
+        &["snapshot", "restore", "0"],
+        &["snapshot", "diff", "5"],
+    ];
+    for args in cases {
+        let out = run_in(&home, tmp.path(), &root, args);
+        assert!(!out.status.success(), "expected failure: {args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.trim().is_empty(), "explains itself: {args:?}");
+        assert!(!err.contains("panicked"), "no panic: {args:?} — {err}");
+    }
+
+    for args in [&["snapshot", "list"][..], &["snapshot", "create"][..]] {
+        let out = run(&home, tmp.path(), args);
+        assert!(!out.status.success(), "expected failure: {args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.trim().is_empty(), "explains itself: {args:?}");
+        assert!(!err.contains("panicked"), "no panic: {args:?} — {err}");
+    }
+}

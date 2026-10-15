@@ -98,10 +98,30 @@ pub fn collect(
         },
     });
 
-    checks.push(Check {
-        ok: false,
-        label: "Git",
-        detail: phase("snapshot versioning", "Phase 6"),
+    // Snapshots (Phase 6): the store is created lazily on first save.
+    checks.push(match project_dir {
+        Some(dir) => match oca_core::snapshot_summary(dir) {
+            Ok((0, _)) => Check {
+                ok: false,
+                label: "Snapshots",
+                detail: "none yet — save one with `oca snapshot create`".into(),
+            },
+            Ok((count, _)) => Check {
+                ok: true,
+                label: "Snapshots",
+                detail: format!("{count} saved (restore points)"),
+            },
+            Err(err) => Check {
+                ok: false,
+                label: "Snapshots",
+                detail: format!("snapshot store unreadable ({err})"),
+            },
+        },
+        None => Check {
+            ok: false,
+            label: "Snapshots",
+            detail: "no project here".into(),
+        },
     });
 
     checks.push({

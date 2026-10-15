@@ -12,8 +12,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== phase gate: only this phase's crates exist =="
 # No big-bang scaffolding: crates are created when their phase arrives
-# (crate → phase table, OCA-implementation.md §2). Phases 0–4 = these + CLI.
-allowed="oca-audio oca-cli oca-core oca-markdown oca-model oca-music oca-storage oca-story oca-tui"
+# (crate → phase table, OCA-implementation.md §2). Phases 0–6 = these + CLI.
+allowed="oca-audio oca-cli oca-core oca-markdown oca-model oca-music oca-storage oca-story oca-tui oca-versioning"
 for dir in crates/*/; do
     name=$(basename "$dir")
     case " $allowed " in

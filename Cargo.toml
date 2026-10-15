@@ -9,6 +9,7 @@ members = [
     "crates/oca-music",
     "crates/oca-audio",
     "crates/oca-tui",
+    "crates/oca-versioning",
 ]
 resolver = "2"
 
@@ -31,6 +32,7 @@ comrak = "0.56"
 cpal = "0.15"
 crossterm = "0.28"
 getrandom = "0.3"
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 hound = "3.5"
 oca-audio = { path = "crates/oca-audio" }
 oca-core = { path = "crates/oca-core" }
@@ -40,6 +42,7 @@ oca-storage = { path = "crates/oca-storage" }
 oca-story = { path = "crates/oca-story" }
 oca-music = { path = "crates/oca-music" }
 oca-tui = { path = "crates/oca-tui" }
+oca-versioning = { path = "crates/oca-versioning" }
 ratatui = "0.29"
 ropey = "1.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -47,6 +50,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+similar = "2"
 time = { version = "0.3", features = ["formatting"] }
 toml = "0.8"
 tracing = "0.1"

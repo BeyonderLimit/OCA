@@ -13,6 +13,7 @@ anyhow.workspace = true
 oca-markdown.workspace = true
 oca-model.workspace = true
 oca-storage.workspace = true
+oca-versioning.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

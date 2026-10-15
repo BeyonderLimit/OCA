@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use oca_audio::{Audio, AudioHost, Player, RecState, Recorder, Take, default_take_dir};
-use oca_core::{Command, Core, RecoveryEntry};
+use oca_core::{Command, Core, Event, RecoveryEntry};
 use oca_model::DocumentKind;
 use oca_music::{CursorMetrics, EnglishPhonetics, Music, cursor_metrics, section_marks};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::editor::{Editor, KeyOutcome};
 
@@ -38,6 +38,8 @@ enum Focus {
     Audio,
     /// The Ctrl-F search panel is capturing the query.
     Search,
+    /// The snapshot panel (restore points + inline diff) is open.
+    Snapshots,
 }
 
 enum TreeItem {
@@ -126,6 +128,25 @@ struct SearchPanel {
     sel: usize,
 }
 
+/// The snapshot panel (Phase 6): the restore-point list, plus the selected
+/// snapshot's inline diff against the working files. All logic lives in
+/// `oca-versioning` behind Core (rule 8).
+struct SnapshotPanel {
+    snapshots: Vec<oca_core::SnapshotInfo>,
+    sel: usize,
+    mode: SnapMode,
+}
+
+enum SnapMode {
+    List,
+    /// Scrollable unified diff of the selected snapshot vs. the files now.
+    Diff {
+        lines: Vec<String>,
+        scroll: u16,
+        title: String,
+    },
+}
+
 /// Present while a song's `lyrics.md` is open: the language its lyric tools
 /// run under plus the loaded phonetics. All analysis lives in `oca-music`
 /// (rule 8) — this only caches what the status bar and section jumps need.
@@ -156,6 +177,8 @@ pub struct App {
     audio_panel: Option<AudioPanel>,
     /// Present while the search panel is open.
     search_panel: Option<SearchPanel>,
+    /// Present while the snapshot panel is open.
+    snap_panel: Option<SnapshotPanel>,
     /// Last pass that reconciled the cache index with external edits.
     last_reconcile: Instant,
     last_journal: Instant,
@@ -192,6 +215,7 @@ impl App {
             audio_host,
             audio_panel: None,
             search_panel: None,
+            snap_panel: None,
             last_reconcile: Instant::now(),
             last_journal: Instant::now(),
             quit: false,
@@ -694,6 +718,146 @@ impl App {
         panel
     }
 
+    // ---- snapshot panel (Phase 6) -------------------------------------------
+
+    /// Open the panel with the project's restore points (oldest first).
+    fn open_snap_panel(&mut self, core: &Core) {
+        let mut panel = SnapshotPanel {
+            snapshots: Vec::new(),
+            sel: 0,
+            mode: SnapMode::List,
+        };
+        match core.snapshots() {
+            Ok(list) => {
+                panel.snapshots = list;
+                panel.sel = panel.snapshots.len().saturating_sub(1);
+                self.status = format!(
+                    "{} snapshot(s) — c saves now, Enter shows changes, r restores",
+                    panel.snapshots.len()
+                );
+            }
+            Err(e) => self.status = format!("snapshots: {e}"),
+        }
+        self.snap_panel = Some(panel);
+        self.focus = Focus::Snapshots;
+    }
+
+    fn snap_key(&mut self, core: &mut Core, key: KeyEvent) {
+        let Some(mut panel) = self.snap_panel.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => match panel.mode {
+                SnapMode::Diff { .. } => panel.mode = SnapMode::List,
+                SnapMode::List => {
+                    self.focus = Focus::Tree;
+                    self.status = "snapshots closed".into();
+                    return;
+                }
+            },
+            KeyCode::Up => match &mut panel.mode {
+                SnapMode::List => panel.sel = panel.sel.saturating_sub(1),
+                SnapMode::Diff { scroll, .. } => *scroll = scroll.saturating_sub(1),
+            },
+            KeyCode::Down => match &mut panel.mode {
+                SnapMode::List => {
+                    if panel.sel + 1 < panel.snapshots.len() {
+                        panel.sel += 1;
+                    }
+                }
+                SnapMode::Diff { scroll, .. } => *scroll += 1,
+            },
+            KeyCode::Enter => match panel.mode {
+                // List: load the diff; Diff: back to the list.
+                SnapMode::List => {
+                    if let Some(info) = panel.snapshots.get(panel.sel) {
+                        match core.snapshot_diff(info.n, None) {
+                            Ok(report) => {
+                                let mut lines = Vec::new();
+                                for f in &report.files {
+                                    if f.binary {
+                                        lines.push(format!(
+                                            "{}: {} (binary)",
+                                            match f.kind {
+                                                oca_core::ChangeKind::Added => "added",
+                                                oca_core::ChangeKind::Removed => "removed",
+                                                oca_core::ChangeKind::Modified => "changed",
+                                            },
+                                            f.path.display()
+                                        ));
+                                    } else {
+                                        lines.extend(f.patch.lines().map(str::to_string));
+                                    }
+                                }
+                                lines.push(String::new());
+                                lines.push(format!(
+                                    "{} — Snapshot #{} vs your files now",
+                                    report.summary, info.n
+                                ));
+                                panel.mode = SnapMode::Diff {
+                                    lines,
+                                    scroll: 0,
+                                    title: format!(" Snapshot #{} ", info.n),
+                                };
+                            }
+                            Err(e) => self.status = format!("diff: {e}"),
+                        }
+                    }
+                }
+                SnapMode::Diff { .. } => panel.mode = SnapMode::List,
+            },
+            KeyCode::Char('c') if matches!(panel.mode, SnapMode::List) => {
+                match core.execute(Command::SnapshotCreate { label: None }) {
+                    Ok(events) => {
+                        if let Some(Event::SnapshotCreated { n, label, files }) = events.first() {
+                            self.status = format!("Snapshot #{n} — {label} · {files} file(s)");
+                        }
+                        if let Ok(list) = core.snapshots() {
+                            panel.snapshots = list;
+                            panel.sel = panel.snapshots.len().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => self.status = format!("snapshot not saved: {e}"),
+                }
+            }
+            KeyCode::Char('r') if matches!(panel.mode, SnapMode::List) => {
+                if let Some(info) = panel.snapshots.get(panel.sel).cloned() {
+                    match core.execute(Command::SnapshotRestore { n: info.n }) {
+                        Ok(events) => {
+                            if let Some(Event::SnapshotRestored {
+                                n,
+                                restored,
+                                removed,
+                                unchanged,
+                                audio_differing,
+                            }) = events.first()
+                            {
+                                self.status = format!(
+                                    "restored Snapshot #{n} — {restored} restored, {removed} removed, {unchanged} unchanged{}",
+                                    if audio_differing.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(
+                                            " · {} take(s) kept as recorded",
+                                            audio_differing.len()
+                                        )
+                                    }
+                                );
+                            }
+                            if let Ok(list) = core.snapshots() {
+                                panel.snapshots = list;
+                                panel.sel = panel.sel.min(panel.snapshots.len().saturating_sub(1));
+                            }
+                        }
+                        Err(e) => self.status = format!("restore refused: {e}"),
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.snap_panel = Some(panel);
+    }
+
     // ---- search panel (Phase 5) --------------------------------------------
 
     /// Keys while the search panel is focused: live query editing, hit
@@ -854,6 +1018,7 @@ impl App {
             Focus::Form => self.form_key(core, key),
             Focus::Audio => self.audio_key(core, key),
             Focus::Search => self.search_key(core, key),
+            Focus::Snapshots => self.snap_key(core, key),
         }
         Ok(())
     }
@@ -908,6 +1073,7 @@ impl App {
             }
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_state_form(),
             KeyCode::Char('a') | KeyCode::Char('A') => self.open_audio_panel(core),
+            KeyCode::Char('v') | KeyCode::Char('V') => self.open_snap_panel(core),
             KeyCode::Tab if self.open_rel.is_some() => {
                 self.focus = Focus::Editor;
             }
@@ -1004,6 +1170,7 @@ impl App {
         self.draw_form(frame);
         self.draw_audio(frame);
         self.draw_search(frame);
+        self.draw_snapshots(frame);
     }
 
     fn draw_tree(&self, frame: &mut Frame, area: Rect) {
@@ -1071,6 +1238,77 @@ impl App {
     }
 
     /// Centered popup for the "set state at this chapter" form.
+    /// Centered popup: the restore-point list, or the selected snapshot's
+    /// inline diff (Phase 6, `V` in the tree).
+    fn draw_snapshots(&self, frame: &mut Frame) {
+        let Some(panel) = &self.snap_panel else {
+            return;
+        };
+        match &panel.mode {
+            SnapMode::List => {
+                let area = centered(frame.area(), 84, 16);
+                let block = Block::default().borders(Borders::ALL).title(" Snapshots ");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let mut lines = Vec::new();
+                if panel.snapshots.is_empty() {
+                    lines.push(Line::styled(
+                        "no snapshots yet — press c to save the current state",
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                for (i, s) in panel.snapshots.iter().enumerate() {
+                    let marker = if i == panel.sel { "▶ " } else { "  " };
+                    let mut line = Line::from(format!(
+                        "{marker}#{:<4} {:<17} {:>5} file(s)  {}",
+                        s.n,
+                        oca_core::format_time(s.when),
+                        s.files,
+                        s.display_label()
+                    ));
+                    if i == panel.sel {
+                        line = line.style(SELECTED_STYLE);
+                    }
+                    lines.push(line);
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    "↑↓ select · c save now · Enter diff · r restore · Esc close",
+                    Style::new().fg(Color::DarkGray),
+                ));
+                frame.render_widget(Paragraph::new(lines), inner);
+            }
+            SnapMode::Diff {
+                lines,
+                scroll,
+                title,
+            } => {
+                let area = centered(frame.area(), 100, 24);
+                let block = Block::default().borders(Borders::ALL).title(title.clone());
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let text: Vec<Line> = lines
+                    .iter()
+                    .map(|l| {
+                        if let Some(rest) = l.strip_prefix('+') {
+                            Line::styled(format!("+{rest}"), Style::new().fg(Color::Green))
+                        } else if let Some(rest) = l.strip_prefix('-') {
+                            Line::styled(format!("-{rest}"), Style::new().fg(Color::Red))
+                        } else if l.starts_with('@') {
+                            Line::styled(l.clone(), Style::new().fg(Color::Cyan))
+                        } else {
+                            Line::from(l.clone())
+                        }
+                    })
+                    .collect();
+                let para = Paragraph::new(text)
+                    .scroll((*scroll, 0))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(para, inner);
+            }
+        }
+    }
+
     fn draw_form(&self, frame: &mut Frame) {
         let Some(form) = &self.form else {
             return;
@@ -1252,13 +1490,14 @@ impl App {
                 " Tab/ Esc tree · Ctrl-F search · Ctrl-S save · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Tree => {
-                " ↑↓ select · Enter open · S state · A audio · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
+                " ↑↓ select · Enter open · S state · A audio · V snapshots · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Form => " Tab field · Enter apply · Esc cancel",
             Focus::Audio => {
                 " ↑↓ select · Enter play · a attach · d delete · r record · p pause · s save · Esc close"
             }
             Focus::Search => " type filter · ↑↓ select · Enter open · Esc close",
+            Focus::Snapshots => " ↑↓ select · c save now · Enter diff · r restore · Esc close",
         };
         let line2 = Line::from(Span::styled(hints, Style::new().fg(Color::DarkGray)));
         frame.render_widget(Paragraph::new(vec![line1, line2]), area);
@@ -2095,6 +2334,80 @@ hold on to the light
         assert_eq!(app.focus, Focus::Search, "data hit does not open an editor");
         assert!(app.search_panel.is_some(), "panel stays open");
         assert!(app.status.contains("data"), "said so: {}", app.status);
+    }
+
+    // ---- snapshot panel (Phase 6) ------------------------------------------
+
+    #[test]
+    fn v_opens_snapshots_c_creates_and_enter_diffs() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('v'))).unwrap();
+        assert_eq!(app.focus, Focus::Snapshots);
+        assert!(
+            app.snap_panel.as_ref().unwrap().snapshots.is_empty(),
+            "nothing saved yet"
+        );
+
+        // `c` saves a snapshot and it shows up in the list.
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        {
+            let panel = app.snap_panel.as_ref().unwrap();
+            assert_eq!(panel.snapshots.len(), 1);
+            assert_eq!(panel.sel, 0);
+        }
+        assert!(app.status.contains("Snapshot #1"), "{}", app.status);
+
+        // Break the chapter, then Enter loads the inline diff.
+        core.save_body(&rel, "rewritten\n").unwrap();
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        {
+            let panel = app.snap_panel.as_ref().unwrap();
+            match &panel.mode {
+                SnapMode::Diff { lines, title, .. } => {
+                    assert!(title.contains("#1"), "{title}");
+                    let text = lines.join("\n");
+                    assert!(text.contains("-# First"), "{text}");
+                    assert!(text.contains("+rewritten"), "{text}");
+                }
+                SnapMode::List => panic!("expected the diff view"),
+            }
+        }
+
+        // Enter again (or Esc) returns to the list; Esc closes.
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            app.snap_panel.as_ref().unwrap().mode,
+            SnapMode::List
+        ));
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.snap_panel.is_none());
+    }
+
+    #[test]
+    fn snapshot_restore_from_panel_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "good text\n").unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('v'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap(); // snapshot #1
+        core.save_body(&rel, "oops\n").unwrap();
+
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        assert!(
+            app.status.contains("restored Snapshot #1"),
+            "{}",
+            app.status
+        );
+        assert_eq!(core.read_document(&rel).unwrap().body(), "good text\n");
+        // The auto-snapshot before restore is now the newest entry.
+        let panel = app.snap_panel.as_ref().unwrap();
+        assert_eq!(panel.snapshots.len(), 2, "{:?}", panel.snapshots);
     }
 
     #[test]

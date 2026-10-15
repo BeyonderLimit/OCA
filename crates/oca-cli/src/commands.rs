@@ -10,7 +10,9 @@ use oca_model::{DocumentKind, ProjectKind};
 use oca_music::CheckReport;
 use oca_storage::registry::Registry;
 
-use crate::cli::{AudioCommand, ChapterCommand, Command, SongCommand, StoryCommand, TagCommand};
+use crate::cli::{
+    AudioCommand, ChapterCommand, Command, SnapshotCommand, SongCommand, StoryCommand, TagCommand,
+};
 
 pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
     match cmd {
@@ -31,6 +33,7 @@ pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
         Command::Tags { project } => tags(project.as_deref()),
         Command::Links { target, project } => links(&target, project.as_deref()),
         Command::Migrate { project } => migrate(project.as_deref()),
+        Command::Snapshot { cmd } => snapshot(cmd),
         Command::Doctor => unreachable!("doctor is dispatched from main"),
     }
 }
@@ -882,4 +885,97 @@ fn migrate(project: Option<&Path>) -> Result<u8> {
         );
     }
     Ok(0)
+}
+
+// ---- snapshots (Phase 6) ---------------------------------------------------
+
+fn snapshot(cmd: SnapshotCommand) -> Result<u8> {
+    match cmd {
+        SnapshotCommand::Create { label, project } => {
+            let mut core = open_core(&find_project(project.as_deref())?)?;
+            let label = label.filter(|l| !l.trim().is_empty());
+            let events = core.execute(CoreCommand::SnapshotCreate { label })?;
+            let Some(Event::SnapshotCreated { n, label, files }) = events.first() else {
+                bail!("snapshot did not report back");
+            };
+            println!("Snapshot #{n} — {label} · {files} file(s)");
+            Ok(0)
+        }
+        SnapshotCommand::List { project } => {
+            let core = open_core(&find_project(project.as_deref())?)?;
+            let list = core.snapshots()?;
+            if list.is_empty() {
+                println!("no snapshots yet — save one with `oca snapshot create`");
+                return Ok(0);
+            }
+            println!("#     WHEN (UTC)          FILES  LABEL");
+            for s in &list {
+                println!(
+                    "{:<5} {:<17} {:>7}  {}",
+                    s.n,
+                    oca_core::format_time(s.when),
+                    s.files,
+                    s.display_label()
+                );
+            }
+            Ok(0)
+        }
+        SnapshotCommand::Diff { n, m, project } => {
+            let core = open_core(&find_project(project.as_deref())?)?;
+            let report = core.snapshot_diff(n, m)?;
+            if report.files.is_empty() {
+                println!("{} — {}", report.summary, describe_against(&report));
+                return Ok(0);
+            }
+            for f in &report.files {
+                if f.binary {
+                    // Images diff as a one-liner; audio says the full story.
+                    println!("{}: {} (binary)", kind_word(f.kind), f.path.display());
+                } else {
+                    println!("{}", f.patch);
+                }
+            }
+            println!("{} — {}", report.summary, describe_against(&report));
+            Ok(0)
+        }
+        SnapshotCommand::Restore { n, project } => {
+            let mut core = open_core(&find_project(project.as_deref())?)?;
+            let events = core.execute(CoreCommand::SnapshotRestore { n })?;
+            let Some(Event::SnapshotRestored {
+                n,
+                restored,
+                removed,
+                unchanged,
+                audio_differing,
+            }) = events.first()
+            else {
+                bail!("restore did not report back");
+            };
+            println!(
+                "restored Snapshot #{n} — {restored} file(s) restored, {removed} removed, {unchanged} unchanged"
+            );
+            for rel in audio_differing {
+                println!(
+                    "  audio kept as recorded: {} (takes are never overwritten or removed)",
+                    rel.display()
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn describe_against(report: &oca_core::DiffReport) -> String {
+    match report.against {
+        Some(m) => format!("Snapshot #{} vs Snapshot #{}", report.base, m),
+        None => format!("Snapshot #{} vs your files now", report.base),
+    }
+}
+
+fn kind_word(kind: oca_core::ChangeKind) -> &'static str {
+    match kind {
+        oca_core::ChangeKind::Added => "added",
+        oca_core::ChangeKind::Removed => "removed",
+        oca_core::ChangeKind::Modified => "changed",
+    }
 }

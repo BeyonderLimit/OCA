@@ -547,7 +547,7 @@ A music query might retrieve: current song, earlier chorus drafts, prior songs o
 
 - Internal Git (`git2`) at `.oca/state/snapshots.git`; UX vocabulary is **Snapshots** only (no commit/HEAD/hash in any user-facing string). Audio is tracked by checksum manifest, not committed as blobs.
 - Auto-snapshot before: AI proposal apply, restore, bulk edit, import.
-- Diff granularity: chapter → scene → paragraph → sentence → word, with restore at each level.
+- Diff granularity: chapter → scene → paragraph → sentence → word, with restore at each level. v0.7 ships the base of this: whole-file restore plus line-level unified diffs (finer-grained views are a rendering concern over the same engine).
 - **Versions** are different from snapshots (A11): snapshots are an automatic project-wide safety net; versions are author-named drafts of one item (`versions/v01.md…`) with save / compare / promote. Promote snapshots first. The mechanism is generic, so chapters get alternate drafts too.
 
 ```

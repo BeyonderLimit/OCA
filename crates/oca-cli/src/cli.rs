@@ -128,8 +128,51 @@ pub enum Command {
         project: Option<PathBuf>,
     },
 
+    /// Snapshots: the project's safety net — every file, restorable whole.
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCommand,
+    },
+
     /// Report the health of each OCA subsystem (warnings are informational; exit 0).
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SnapshotCommand {
+    /// Save the current state as a restore point (history only grows).
+    Create {
+        /// What this moment is called (e.g. "Before the rewrite").
+        label: Option<String>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// List saved snapshots, oldest first.
+    List {
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Show changes: snapshot <n> vs the working files, or vs <m>.
+    Diff {
+        /// Snapshot number (see `oca snapshot list`).
+        n: usize,
+        /// Compare with this snapshot instead of the working files.
+        m: Option<usize>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Return the project to snapshot <n>. The current state is saved
+    /// first; audio takes are never touched (only reported).
+    Restore {
+        /// Snapshot number to restore.
+        n: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
