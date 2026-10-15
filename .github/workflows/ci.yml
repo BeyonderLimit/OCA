@@ -56,3 +56,23 @@ jobs:
           name: oca-${{ matrix.os }}-${{ matrix.profile }}
           path: target/${{ matrix.profile == 'release' && 'release' || 'debug' }}/oca*
           if-no-files-found: error
+
+  perf:
+    name: Perf budgets (A10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install ALSA headers (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      # A10 budgets are mid-range-laptop numbers; shared runners are slower
+      # and noisier, so the ceilings here are relaxed (still meaningful —
+      # local runs clear them 3-10x). Defaults in scripts/perf.sh are A10.
+      - name: perf on generated 500k-word corpus
+        env:
+          BUDGET_OPEN_MS: 1500
+          BUDGET_SEARCH_MS: 300
+          BUDGET_REINDEX1_MS: 600
+        run: scripts/perf.sh

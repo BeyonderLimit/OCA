@@ -36,6 +36,8 @@ enum Focus {
     Form,
     /// The audio panel (take list + record controls) is open.
     Audio,
+    /// The Ctrl-F search panel is capturing the query.
+    Search,
 }
 
 enum TreeItem {
@@ -115,6 +117,15 @@ enum Banner {
     Recovery { entry: RecoveryEntry },
 }
 
+/// The Ctrl-F search panel: the query typed so far, live hits, and the
+/// selection. All querying goes through `Core::search` — the index and its
+/// FTS syntax live in oca-storage (rule 8).
+struct SearchPanel {
+    query: String,
+    hits: Vec<oca_core::Hit>,
+    sel: usize,
+}
+
 /// Present while a song's `lyrics.md` is open: the language its lyric tools
 /// run under plus the loaded phonetics. All analysis lives in `oca-music`
 /// (rule 8) — this only caches what the status bar and section jumps need.
@@ -143,6 +154,10 @@ pub struct App {
     audio_host: Arc<dyn AudioHost>,
     /// Present while the audio panel is open.
     audio_panel: Option<AudioPanel>,
+    /// Present while the search panel is open.
+    search_panel: Option<SearchPanel>,
+    /// Last pass that reconciled the cache index with external edits.
+    last_reconcile: Instant,
     last_journal: Instant,
     quit: bool,
     /// Last drawn inner editor rect (mouse mapping); sane default pre-draw.
@@ -176,6 +191,8 @@ impl App {
             song_metrics: None,
             audio_host,
             audio_panel: None,
+            search_panel: None,
+            last_reconcile: Instant::now(),
             last_journal: Instant::now(),
             quit: false,
             editor_area: Rect::new(0, 0, 72, 24),
@@ -459,6 +476,14 @@ impl App {
 
     pub fn tick(&mut self, core: &mut Core) -> Result<()> {
         self.journal_now(core, false);
+        // Reconcile the cache index with edits made outside this session
+        // (the polling watcher — mtime walk, only changed files reparse).
+        // Skip while read-only: the session holding the lock maintains it.
+        const RECONCILE_EVERY: Duration = Duration::from_secs(5);
+        if !core.is_read_only() && self.last_reconcile.elapsed() >= RECONCILE_EVERY {
+            self.last_reconcile = Instant::now();
+            let _ = core.reconcile();
+        }
         // Retire finished playback so the panel stops saying "playing".
         if let Some(panel) = &mut self.audio_panel
             && let Some(player) = &panel.player
@@ -669,6 +694,96 @@ impl App {
         panel
     }
 
+    // ---- search panel (Phase 5) --------------------------------------------
+
+    /// Keys while the search panel is focused: live query editing, hit
+    /// navigation, opening a hit. Esc closes by *not* storing the panel
+    /// back (same close semantics as the audio panel).
+    fn search_key(&mut self, core: &mut Core, key: KeyEvent) {
+        let Some(mut panel) = self.search_panel.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Tree;
+                self.status = "search closed".into();
+                return;
+            }
+            KeyCode::Enter => {
+                if let Some(hit) = panel.hits.get(panel.sel) {
+                    match Self::hit_target(&self.items, &hit.rel) {
+                        Some(rel) => {
+                            // Opening moves focus to the editor; the panel
+                            // is dropped by not storing it back.
+                            self.open_doc(core, rel);
+                            return;
+                        }
+                        None => {
+                            self.status = format!(
+                                "{} — data, not a tree document (open its file from the tree)",
+                                hit.rel.display()
+                            );
+                        }
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if panel.sel + 1 < panel.hits.len() {
+                    panel.sel += 1;
+                }
+            }
+            KeyCode::Up => panel.sel = panel.sel.saturating_sub(1),
+            KeyCode::Backspace => {
+                panel.query.pop();
+                self.run_search(core, &mut panel);
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                panel.query.push(c);
+                self.run_search(core, &mut panel);
+            }
+            _ => {}
+        }
+        self.search_panel = Some(panel);
+    }
+
+    /// Re-run the query (each keystroke — FTS over the cache is fast even
+    /// on a 500k-word corpus, A10).
+    fn run_search(&mut self, core: &Core, panel: &mut SearchPanel) {
+        panel.sel = 0;
+        if panel.query.trim().is_empty() {
+            panel.hits.clear();
+            self.status = "search — type to filter, Enter opens, Esc closes".into();
+            return;
+        }
+        match core.search(&panel.query, 50) {
+            Ok(hits) => {
+                self.status = format!("{} match(es)", hits.len());
+                panel.hits = hits;
+            }
+            Err(e) => {
+                panel.hits.clear();
+                self.status = format!("search: {e}");
+            }
+        }
+    }
+
+    /// The tree document a search hit opens, or `None` for data rows
+    /// (takes, raw YAML). Song metadata maps to its lyrics file — that's
+    /// the song's editable face in the tree.
+    fn hit_target(items: &[TreeItem], hit_rel: &Path) -> Option<PathBuf> {
+        let mut rel = hit_rel.to_path_buf();
+        if rel.file_name().is_some_and(|n| n == "song.yaml") {
+            rel = rel.parent()?.join("lyrics.md");
+        }
+        items
+            .iter()
+            .any(|item| matches!(item, TreeItem::Doc { rel: r, .. } if *r == rel))
+            .then_some(rel)
+    }
+
     // ---- input -----------------------------------------------------------
 
     pub fn on_key(&mut self, core: &mut Core, key: KeyEvent) -> Result<()> {
@@ -688,6 +803,16 @@ impl App {
                 }
                 KeyCode::Char('n') => {
                     self.new_chapter(core);
+                    return Ok(());
+                }
+                KeyCode::Char('f') if matches!(self.focus, Focus::Tree | Focus::Editor) => {
+                    self.search_panel = Some(SearchPanel {
+                        query: String::new(),
+                        hits: Vec::new(),
+                        sel: 0,
+                    });
+                    self.focus = Focus::Search;
+                    self.status = "search — type to filter, Enter opens, Esc closes".into();
                     return Ok(());
                 }
                 _ => {}
@@ -728,6 +853,7 @@ impl App {
             Focus::Editor => self.editor_key(key),
             Focus::Form => self.form_key(core, key),
             Focus::Audio => self.audio_key(core, key),
+            Focus::Search => self.search_key(core, key),
         }
         Ok(())
     }
@@ -877,6 +1003,7 @@ impl App {
         self.draw_status(core, frame, rows[1]);
         self.draw_form(frame);
         self.draw_audio(frame);
+        self.draw_search(frame);
     }
 
     fn draw_tree(&self, frame: &mut Frame, area: Rect) {
@@ -1045,6 +1172,55 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Centered popup: query line + live hit list (Phase 5 search, Ctrl-F).
+    fn draw_search(&self, frame: &mut Frame) {
+        let Some(panel) = &self.search_panel else {
+            return;
+        };
+        let area = centered(frame.area(), 84, 20);
+        let block = Block::default().borders(Borders::ALL).title(" Search ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::from(format!(
+                "{}▏",
+                if panel.query.is_empty() {
+                    Span::styled(
+                        "type to search chapters, characters, songs, notes, takes…",
+                        Style::new().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::raw(panel.query.clone())
+                }
+            )),
+            Line::from(""),
+        ];
+        if !panel.query.is_empty() && panel.hits.is_empty() {
+            lines.push(Line::styled("no matches", Style::new().fg(Color::DarkGray)));
+        }
+        for (i, hit) in panel.hits.iter().enumerate() {
+            let marker = if i == panel.sel { "▶ " } else { "  " };
+            let snippet = hit.snippet.replace('\n', " ");
+            let mut line = Line::from(format!(
+                "{marker}{:<9} {} — {}",
+                hit.kind,
+                truncate(&hit.title, 26),
+                truncate(&snippet, 34)
+            ));
+            if i == panel.sel {
+                line = line.style(SELECTED_STYLE);
+            }
+            lines.push(line);
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "type filter · ↑↓ select · Enter open · Esc close",
+            Style::new().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_status(&self, core: &Core, frame: &mut Frame, area: Rect) {
         let line1 = if let Some(Banner::Recovery { entry }) = &self.banner {
             Line::from(vec![
@@ -1070,16 +1246,19 @@ impl App {
         };
         let hints = match self.focus {
             Focus::Editor if self.song.is_some() => {
-                " Tab/ Esc tree · Alt-]/Alt-[ section · Ctrl-S save · Ctrl-Q quit"
+                " Tab/ Esc tree · Ctrl-F search · Alt-]/Alt-[ section · Ctrl-S save · Ctrl-Q quit"
             }
-            Focus::Editor => " Tab/ Esc tree · Ctrl-S save · Ctrl-N chapter · Ctrl-Q quit",
+            Focus::Editor => {
+                " Tab/ Esc tree · Ctrl-F search · Ctrl-S save · Ctrl-N chapter · Ctrl-Q quit"
+            }
             Focus::Tree => {
-                " ↑↓ select · Enter open · S state · A audio · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
+                " ↑↓ select · Enter open · S state · A audio · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Form => " Tab field · Enter apply · Esc cancel",
             Focus::Audio => {
                 " ↑↓ select · Enter play · a attach · d delete · r record · p pause · s save · Esc close"
             }
+            Focus::Search => " type filter · ↑↓ select · Enter open · Esc close",
         };
         let line2 = Line::from(Span::styled(hints, Style::new().fg(Color::DarkGray)));
         frame.render_widget(Paragraph::new(vec![line1, line2]), area);
@@ -1838,5 +2017,104 @@ hold on to the light
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Audio"), "panel title renders");
         assert!(text.contains("no takes yet"), "empty state renders");
+    }
+
+    // ---- search panel (Phase 5) -------------------------------------------
+
+    #[test]
+    fn ctrl_f_opens_search_and_enter_opens_the_hit() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, ctrl('f')).unwrap();
+        assert_eq!(app.focus, Focus::Search);
+        let panel = app.search_panel.as_ref().expect("panel open");
+        assert!(panel.query.is_empty() && panel.hits.is_empty());
+
+        for c in "first".chars() {
+            app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
+        }
+        {
+            let panel = app.search_panel.as_ref().unwrap();
+            assert_eq!(panel.query, "first");
+            assert!(!panel.hits.is_empty(), "the chapter is found");
+            assert_eq!(panel.hits[0].rel, rel);
+        }
+
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.open_rel.as_ref(), Some(&rel), "hit opens the doc");
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.search_panel.is_none(), "panel closes on open");
+    }
+
+    #[test]
+    fn search_esc_closes_back_to_the_tree() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, ctrl('f')).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('z'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Backspace)).unwrap();
+        assert!(
+            app.search_panel.as_ref().unwrap().query.is_empty(),
+            "backspace edits the query"
+        );
+
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.search_panel.is_none(), "Esc drops the panel");
+    }
+
+    #[test]
+    fn search_data_hits_say_so_and_keep_the_panel() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        // An audio take sidecar: indexed, but not a tree document.
+        let audio = tmp.path().join("audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        std::fs::write(
+            audio.join("memo.yaml"),
+            "take_id: take_1\ntitle: Voice memo\n",
+        )
+        .unwrap();
+        core.reconcile().unwrap();
+
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, ctrl('f')).unwrap();
+        for c in "memo".chars() {
+            app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
+        }
+        assert!(
+            !app.search_panel.as_ref().unwrap().hits.is_empty(),
+            "the take is indexed"
+        );
+
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.focus, Focus::Search, "data hit does not open an editor");
+        assert!(app.search_panel.is_some(), "panel stays open");
+        assert!(app.status.contains("data"), "said so: {}", app.status);
+    }
+
+    #[test]
+    fn search_panel_draws() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, ctrl('f')).unwrap();
+        for c in "first".chars() {
+            app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
+        }
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw(&core, frame))
+            .expect("frame renders");
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Search"), "panel title renders");
+        assert!(text.contains("chapter"), "hit kind renders");
     }
 }

@@ -414,6 +414,37 @@ AI use: *"20 rhymes for this line that aren't cliché"* — the dictionary suppl
 - **Typography cleanup** (configurable): smart quotes, em-dash (`--`→`—`), ellipsis, collapse spaces, preserve code blocks.
 - Story state queries: *Where is Elena? Who is Marcus? Which chapters contain Elena? What happened before chapter 8?*
 
+### 6.4 Search, tags, and backlinks (Phase 5)
+
+All served by the cache DB (`.oca/cache/oca.db` — derived, rebuildable with
+`oca reindex`; ADR-0023). No AI involved.
+
+**Indexed units** — one FTS5 table spans every entity: chapters and world
+docs (title + body), character/location/timeline files (frontmatter text),
+song metadata + lyric sections (`kind: song`/`lyrics`), timeline events
+(title + summary), and audio take sidecars (`kind: audio`). Author input is
+never interpreted as FTS syntax: every term is quoted, the last is
+prefix-matched, and `tag:` routes to a tag lookup.
+
+- `oca search <words> [--limit N]` — cross-entity hits with kind, title,
+  path, and a highlighted snippet. Deleting the DB loses nothing: the next
+  open (or search) rebuilds from the files.
+- `oca tag add|remove|list <doc> <ns:value>` — patches the `tags:` block
+  losslessly (comments/unknown keys survive; removing the last tag drops
+  the block). Tags are `namespace:value` or a bare word; `oca tags` lists
+  them project-wide with counts.
+- `oca links <id-or-title>` — a document's outgoing references and its
+  backlinks, resolved by immutable id (never path).
+- `oca reindex [--full]` — incremental reconcile (mtime walk) by default;
+  `--full` rebuilds from scratch.
+- `oca migrate` — the file-format + DB-schema migration entry point
+  (no-op when current).
+
+The TUI reaches the same engine through **Ctrl-F**: live query, ↑↓ to
+select, Enter opens the hit. External edits made outside the session
+surface within seconds (polling reconcile on the idle tick) and on
+open/save.
+
 ---
 
 ## 7. AI layer

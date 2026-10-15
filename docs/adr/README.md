@@ -27,3 +27,5 @@ results such as ADR-0021). Full rationale lives in
 | [0019](0019-d7-binary-name.md) | D7 | Binary name `oca` |
 | [0020](0020-d8-sqlite-vec-runtime-packs.md) | D8 | Embedded sqlite-vec + runtime packs |
 | [0021](0021-custom-rope-editor.md) | A9 spike | Custom rope editor (`tui-textarea` rejected) |
+| [0022](0022-audio-takes.md) | Phase 4 | Audio takes: WAV + sidecar, quiet devices |
+| [0023](0023-cache-db-search-units.md) | Phase 5 | Cache DB: one SQLite file, FTS5 units, mtime reconcile |

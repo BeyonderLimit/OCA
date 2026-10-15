@@ -73,8 +73,98 @@ pub enum Command {
         cmd: AudioCommand,
     },
 
+    /// Rebuild the cache index from the files (files are canonical; the
+    /// index in `.oca/cache/oca.db` is derived — Phase 5).
+    Reindex {
+        /// Reparse every file, even ones that did not change.
+        #[arg(long)]
+        full: bool,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Full-text search across chapters, characters, world, outline, songs,
+    /// lyrics, and audio notes; `tag:ns:value` searches tags instead.
+    Search {
+        /// Words to search for (the last word matches as a prefix).
+        query: Vec<String>,
+        /// Maximum number of hits to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Read or edit a document's tags (`namespace:value`, e.g.
+    /// `character:elena`).
+    Tag {
+        #[command(subcommand)]
+        cmd: TagCommand,
+    },
+
+    /// List every tag in the project with usage counts.
+    Tags {
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Show a document's outgoing references and its backlinks (by id or
+    /// title — links never use paths).
+    Links {
+        /// Document id or title.
+        target: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Bring the project's file format up to date (a no-op when current).
+    Migrate {
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
     /// Report the health of each OCA subsystem (warnings are informational; exit 0).
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TagCommand {
+    /// Show the tags on a document.
+    List {
+        /// Document id or title.
+        doc: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Add a tag to a document (frontmatter patch; comments and unknown
+    /// keys survive).
+    Add {
+        /// Document id or title.
+        doc: String,
+        /// Tag to add — `namespace:value` or a bare word.
+        tag: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Remove a tag from a document.
+    Remove {
+        /// Document id or title.
+        doc: String,
+        /// Tag to remove.
+        tag: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

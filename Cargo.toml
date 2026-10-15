@@ -42,6 +42,7 @@ oca-music = { path = "crates/oca-music" }
 oca-tui = { path = "crates/oca-tui" }
 ratatui = "0.29"
 ropey = "1.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

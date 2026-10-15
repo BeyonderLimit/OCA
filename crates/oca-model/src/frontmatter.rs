@@ -87,6 +87,18 @@ impl Frontmatter {
         Ok(())
     }
 
+    /// Remove a top-level key and its whole block. No-op when the key is
+    /// absent. Errors when the document has no frontmatter.
+    pub fn remove_key(&mut self, key: &str) -> Result<()> {
+        let body = self
+            .body()
+            .ok_or_else(|| anyhow!("document has no frontmatter"))?;
+        let mut yaml = LosslessYaml::new(body);
+        yaml.remove_key(key)?;
+        self.raw = Some(fence(yaml.raw()));
+        Ok(())
+    }
+
     /// Patch one top-level key. Errors when the document has no frontmatter or
     /// the value is multi-line (see `LosslessYaml::set_str`).
     pub fn set_str(&mut self, key: &str, value: &str) -> Result<()> {

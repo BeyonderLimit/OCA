@@ -1,6 +1,6 @@
 # ADR-0020: Embedded sqlite-vec + runtime packs (D8)
 
-- Status: Accepted (decision; static linking pending Phase 5 spike) · Date: 2026-10-08 · Code: **D8**
+- Status: Accepted · spike passed (Phase 5: `sqlite3_auto_extension` + `sqlite3_vec_init` linked, `vec0` create/insert/distance query works — `crates/oca-storage/tests/spike.rs`) · Date: 2026-10-08 · Code: **D8**
 - Source: `OCA-amendments.md` §5 D8
 
 ## Decision

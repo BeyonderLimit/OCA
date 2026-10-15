@@ -612,3 +612,192 @@ fn phase4_audio_errors_are_reported_not_crashed() {
         assert!(!err.trim().is_empty(), "failure explains itself: {args:?}");
     }
 }
+
+/// Phase 5 exit: search returns correct cross-entity hits on the sample
+/// project (chapters + character + timeline event in one query, audio
+/// metadata too); deleting the DB and searching again reproduces identical
+/// results; tags/links/migrate behave; `doctor` reports the index with an
+/// empty stderr. No AI involved anywhere.
+#[test]
+fn phase5_exit_search_reindex_tags_links_over_sample_novel() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0001");
+
+    // Full reindex reports what it built.
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["reindex", "--full"]));
+    assert!(out.contains("full reindex"), "got: {out}");
+    assert!(out.contains("documents"), "totals reported: {out}");
+    // 10 chapters + 2 characters + timeline + lyrics + README = 15 docs.
+    assert!(out.contains("15 documents"), "got: {out}");
+    assert!(out.contains("1 takes"), "the seeded take: {out}");
+
+    // Cross-entity search: one term hits chapters, the character file, and
+    // a timeline event (event text lives in frontmatter, not the body).
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["search", "elena", "--limit", "50"],
+    ));
+    assert!(out.contains("chapter"), "chapters: {out}");
+    assert!(out.contains("character"), "character: {out}");
+    assert!(out.contains("event"), "timeline event: {out}");
+    assert!(out.contains("manuscript/"), "paths shown: {out}");
+    assert!(out.contains("characters/elena.md"), "got: {out}");
+
+    // Audio metadata (sidecar note/title) is searchable; the sidecar stays
+    // canonical — the DB only indexes it.
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["search", "memo"]));
+    assert!(out.contains("audio"), "take metadata: {out}");
+
+    // --- delete DB → search again → identical results (rebuild rule) ---
+    let before = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["search", "elena", "--limit", "50"],
+    ));
+    let db = root.join(".oca/cache/oca.db");
+    std::fs::remove_file(&db).unwrap();
+    let _ = std::fs::remove_file(format!("{}-wal", db.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db.display()));
+    let after = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["search", "elena", "--limit", "50"],
+    ));
+    assert_eq!(
+        before, after,
+        "a rebuilt index must answer identically (files are canonical)"
+    );
+
+    // --- tags: add (lossless patch), search by tag, list, remove ---
+    let doc = root.join("manuscript/001-the-arrival.md");
+    let raw = std::fs::read_to_string(&doc).unwrap();
+    let commented = raw.replace("id: ch_001", "# keep this comment\nid: ch_001");
+    assert_ne!(commented, raw, "fixture edit applies");
+    std::fs::write(&doc, commented).unwrap();
+
+    stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["tag", "add", "ch_001", "status:draft"],
+    ));
+    let raw = std::fs::read_to_string(&doc).unwrap();
+    assert!(
+        raw.contains("# keep this comment"),
+        "comment survives: {raw}"
+    );
+    assert!(raw.contains("tags:"), "tags block written: {raw}");
+    assert!(raw.contains("status:draft"), "got: {raw}");
+
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["search", "tag:status:draft"],
+    ));
+    assert!(out.contains("001-the-arrival.md"), "tag search: {out}");
+
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["tags"]));
+    assert!(out.contains("status:draft"), "tag listing: {out}");
+
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["tag", "list", "ch_001"],
+    ));
+    assert!(out.contains("status:draft"), "per-doc tags: {out}");
+
+    stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["tag", "remove", "ch_001", "status:draft"],
+    ));
+    let raw = std::fs::read_to_string(&doc).unwrap();
+    assert!(!raw.contains("tags:"), "empty tags block dropped: {raw}");
+    assert!(raw.contains("# keep this comment"), "still there: {raw}");
+
+    // --- links: song's authored references, and the chapter's backlinks ---
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["links", "song_ashes"]));
+    assert!(out.contains("chapters"), "link kinds: {out}");
+    assert!(out.contains("ch_001"), "outgoing target: {out}");
+    assert!(out.contains("elena"), "character link: {out}");
+
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["links", "ch_001"]));
+    assert!(out.contains("song_ashes"), "backlink source: {out}");
+    assert!(out.contains('←'), "marked as incoming: {out}");
+
+    // --- migrate: format 1 is current ---
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["migrate"]));
+    assert!(out.contains("current"), "got: {out}");
+
+    // --- doctor: real index check, zero stderr (guardrail) — run from
+    // inside the project, since doctor takes no --project flag ---
+    let out = run(&home, &root, &["doctor"]);
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.is_empty(), "doctor keeps stderr empty: {err}");
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("✓ Database"), "database check: {out}");
+    assert!(out.contains(".oca/cache/oca.db"), "got: {out}");
+}
+
+/// Phase 5 error paths: every bad input fails with a message, never a
+/// panic; `reindex`/`search` outside a project explain themselves.
+#[test]
+fn phase5_index_errors_are_reported_not_crashed() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+
+    let cases: &[&[&str]] = &[
+        &["search"],                          // empty query
+        &["tag", "add", "ch_001", "bad tag"], // YAML-hostile tag
+        &["tag", "add", "ch_001", "a:b:c"],   // one namespace only
+        &["tag", "add", "no-such-doc", "ok:tag"],
+        &["tag", "remove", "ch_001", "absent:tag"],
+        &["tag", "list", "no-such-doc"],
+        &["links", "no-such-thing"],
+    ];
+    for args in cases {
+        let out = run_in(&home, tmp.path(), &root, args);
+        assert!(
+            !out.status.success(),
+            "expected failure: {args:?}\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.trim().is_empty(), "explains itself: {args:?}");
+        assert!(!err.contains("panicked"), "no panic: {args:?} — {err}");
+    }
+
+    // Outside any project: not-a-project, not a panic.
+    for args in [&["reindex"][..], &["search", "x"][..], &["migrate"][..]] {
+        let out = run(&home, tmp.path(), args);
+        assert!(!out.status.success(), "expected failure: {args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.trim().is_empty(), "explains itself: {args:?}");
+        assert!(!err.contains("panicked"), "no panic: {args:?} — {err}");
+    }
+
+    // Doctor outside a project: warning, exit 0, empty stderr (Phase 0
+    // contract still holds now that Database is a real check).
+    let out = run(&home, tmp.path(), &["doctor"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("⚠ Database — no project here"), "got: {out}");
+}

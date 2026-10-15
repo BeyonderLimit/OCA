@@ -1,10 +1,13 @@
 //! OCA filesystem storage: project lifecycle, safe writes, single-writer
-//! lock, recovery journal, and the id→path index.
+//! lock, recovery journal, the id→path index, and the rebuildable cache
+//! database (SQLite/FTS5, Phase 5 — `db` module).
 //!
 //! Layering: this crate owns *bytes on disk*; policy (read-only gates,
-//! events) is enforced one level up in `oca-core`.
+//! events) is enforced one level up in `oca-core`. The cache DB is
+//! derived state: files stay canonical and `oca reindex` rebuilds it.
 
 pub mod atomic;
+pub mod db;
 pub mod index;
 pub mod journal;
 pub mod layout;
@@ -44,13 +47,16 @@ impl ReadOnly {
     }
 }
 
-/// An open project: root + metadata + lock + document index.
+/// An open project: root + metadata + lock + document index + cache DB.
 pub struct Project {
     root: PathBuf,
     meta: ProjectMeta,
     _lock: Option<Lock>,
     read_only: Option<ReadOnly>,
     index: Index,
+    /// Cache database; `None` when it can't be opened (search then says
+    /// so — editing never depends on it, rule 2).
+    db: Option<db::Db>,
 }
 
 impl Project {
@@ -74,6 +80,11 @@ impl Project {
             .with_context(|| format!("read {}", yaml_path.display()))?;
         let meta = ProjectMeta::parse(&raw)?;
 
+        // Self-provision `.oca/…` when opening a tree that predates them
+        // (adopted/imported/generated projects — rule 2: only cache/state
+        // dirs appear, never content). Idempotent.
+        layout::ensure_app_dirs(&root)?;
+
         let lock = Lock::acquire(&root)?;
         let read_only = if !meta.is_writable_format() {
             Some(ReadOnly::FutureFormat {
@@ -89,12 +100,35 @@ impl Project {
         let entries = index::scan(&root)?;
         let mut index = Index::default();
         index.rebuild(entries);
+
+        // Cache DB (Phase 5): best-effort open + refresh. A broken cache
+        // never blocks editing — it degrades to "search unavailable".
+        let mut db = match db::Db::open(&root) {
+            Ok(db) => Some(db),
+            Err(err) => {
+                tracing::warn!(error = %err, "cache index unavailable");
+                None
+            }
+        };
+        if let Some(cache) = db.as_mut() {
+            let empty = cache.totals().map(|t| t.documents == 0).unwrap_or(true);
+            let warmed = if empty {
+                cache.reindex_all(&root)
+            } else {
+                cache.reconcile(&root)
+            };
+            if let Err(err) = warmed {
+                tracing::warn!(error = %err, "cache index refresh failed");
+            }
+        }
+
         Ok(Project {
             root,
             meta,
             _lock: lock,
             read_only,
             index,
+            db,
         })
     }
 
@@ -206,6 +240,7 @@ impl Project {
         }
         write_new(&self.root.join(&rel), raw.as_bytes())?;
         self.refresh_index()?;
+        self.touch_index(&rel);
         Ok(rel)
     }
 
@@ -221,7 +256,55 @@ impl Project {
         if !existed {
             self.refresh_index()?;
         }
+        self.touch_index(rel);
         Ok(())
+    }
+
+    /// Reindex one saved file in the cache DB (best-effort: a cache hiccup
+    /// must never fail a save — the files are what matters).
+    fn touch_index(&mut self, rel: &Path) {
+        if let Some(db) = self.db.as_mut()
+            && let Err(err) = db.index_file(&self.root, rel)
+        {
+            tracing::warn!(rel = %rel.display(), error = %err, "cache index update failed");
+        }
+    }
+
+    /// The cache database, when it could be opened (search/tags/links).
+    pub fn db(&self) -> Option<&db::Db> {
+        self.db.as_ref()
+    }
+
+    /// Open the cache DB on demand (e.g. `oca reindex` after a failed
+    /// first open).
+    pub fn db_or_open(&mut self) -> Result<&mut db::Db> {
+        if self.db.is_none() {
+            self.db = Some(db::Db::open(&self.root)?);
+        }
+        self.db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("cache index unavailable"))
+    }
+
+    /// Full rebuild from the filesystem (`oca reindex --full`).
+    pub fn reindex_all(&mut self) -> Result<db::ReindexStats> {
+        let root = self.root.clone();
+        self.db_or_open()?.reindex_all(&root)
+    }
+
+    /// Incremental refresh: only changed files are reparsed.
+    pub fn reconcile(&mut self) -> Result<db::ReindexStats> {
+        let root = self.root.clone();
+        self.db_or_open()?.reconcile(&root)
+    }
+
+    /// Search the cache index (FTS5, or `tag:ns:value` for tags).
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<db::Hit>> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cache index unavailable — run `oca reindex`"))?;
+        db.search(query, limit)
     }
 
     /// Append one paragraph to `rel`; returns the new raw bytes.

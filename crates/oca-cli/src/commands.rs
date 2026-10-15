@@ -10,7 +10,7 @@ use oca_model::{DocumentKind, ProjectKind};
 use oca_music::CheckReport;
 use oca_storage::registry::Registry;
 
-use crate::cli::{AudioCommand, ChapterCommand, Command, SongCommand, StoryCommand};
+use crate::cli::{AudioCommand, ChapterCommand, Command, SongCommand, StoryCommand, TagCommand};
 
 pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
     match cmd {
@@ -21,6 +21,16 @@ pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
         Command::Story { cmd } => story(cmd),
         Command::Song { cmd } => song(cmd),
         Command::Audio { cmd } => audio(cmd),
+        Command::Reindex { full, project } => reindex(full, project.as_deref()),
+        Command::Search {
+            query,
+            limit,
+            project,
+        } => search(&query.join(" "), limit, project.as_deref()),
+        Command::Tag { cmd } => tag(cmd),
+        Command::Tags { project } => tags(project.as_deref()),
+        Command::Links { target, project } => links(&target, project.as_deref()),
+        Command::Migrate { project } => migrate(project.as_deref()),
         Command::Doctor => unreachable!("doctor is dispatched from main"),
     }
 }
@@ -581,4 +591,295 @@ fn print_takes(takes: &[oca_audio::Take]) {
             take.wav_rel.display()
         );
     }
+}
+
+// ---- cache index: reindex, search, tags, links, migrate (Phase 5) -----------
+
+/// `oca reindex` — the DB is derived state; this rebuilds it from the files.
+/// Default is the incremental reconcile (only changed files are reparsed);
+/// `--full` forces a from-scratch rebuild.
+fn reindex(full: bool, project: Option<&Path>) -> Result<u8> {
+    let root = find_project(project)?;
+    let mut core = open_core(&root)?;
+    let started = std::time::Instant::now();
+    let stats = if full {
+        core.reindex()?
+    } else {
+        core.reconcile()?
+    };
+    let elapsed_ms = started.elapsed().as_millis();
+    println!(
+        "{}: {} file(s) indexed, {} removed — {} ms",
+        if full { "full reindex" } else { "reindex" },
+        stats.updated,
+        stats.removed,
+        elapsed_ms
+    );
+    if let Some(t) = core.index_totals() {
+        println!(
+            "{} documents · {} searchable units · {} tags · {} links · {} takes · {} songs · {} characters · {} events",
+            t.documents, t.units, t.tags, t.links, t.takes, t.songs, t.characters, t.events
+        );
+    }
+    Ok(0)
+}
+
+fn search(query: &str, limit: usize, project: Option<&Path>) -> Result<u8> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("nothing to search for — usage: oca search <words>");
+    }
+    let root = find_project(project)?;
+    let core = open_core(&root)?;
+    let hits = core.search(query, limit)?;
+    if hits.is_empty() {
+        println!("no matches for \"{query}\"");
+        return Ok(0);
+    }
+    for hit in &hits {
+        println!(
+            "{:<9} {:<26} {}",
+            hit.kind,
+            ellipsize(&hit.title, 26),
+            hit.rel.display()
+        );
+        if !hit.snippet.is_empty() {
+            println!("          {}", hit.snippet.replace('\n', " "));
+        }
+    }
+    println!("{} match(es)", hits.len());
+    Ok(0)
+}
+
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+fn tags(project: Option<&Path>) -> Result<u8> {
+    let core = open_core(&find_project(project)?)?;
+    let list = core.tags()?;
+    if list.is_empty() {
+        println!("no tags yet — add one with `oca tag add <doc> <namespace:value>`");
+        return Ok(0);
+    }
+    for t in list {
+        println!("{:<32} {} document(s)", t.tag, t.uses);
+    }
+    Ok(0)
+}
+
+fn tag(cmd: TagCommand) -> Result<u8> {
+    match cmd {
+        TagCommand::List { doc, project } => {
+            let mut core = story_core(project.as_deref())?;
+            let rel = core.resolve(&doc)?;
+            let document = core.read_document(&rel)?;
+            let tags = document.frontmatter.get_seq("tags").unwrap_or_default();
+            if tags.is_empty() {
+                println!("no tags on {}", rel.display());
+            } else {
+                for t in tags {
+                    println!("{t}");
+                }
+            }
+            Ok(0)
+        }
+        TagCommand::Add { doc, tag, project } => set_tag(&doc, &tag, true, project.as_deref()),
+        TagCommand::Remove { doc, tag, project } => set_tag(&doc, &tag, false, project.as_deref()),
+    }
+}
+
+/// Deterministic tag editing: frontmatter patch through Core, then the save
+/// path reindexes. Case-insensitive membership; the stored spelling is
+/// preserved for pre-existing tags.
+fn set_tag(doc: &str, tag: &str, add: bool, project: Option<&Path>) -> Result<u8> {
+    validate_tag(tag)?;
+    let mut core = story_core(project)?;
+    let rel = core.resolve(doc)?;
+    let mut document = core.read_document(&rel)?;
+    let mut tags = document.frontmatter.get_seq("tags").unwrap_or_default();
+    let lower = tag.to_ascii_lowercase();
+    let present = tags.iter().any(|t| t.to_ascii_lowercase() == lower);
+    if add && present {
+        println!("{tag} is already on {}", rel.display());
+        return Ok(0);
+    }
+    if !add && !present {
+        if tags.is_empty() {
+            bail!("{} has no tags", rel.display());
+        }
+        bail!(
+            "{tag} is not on {} (tags: {})",
+            rel.display(),
+            tags.join(", ")
+        );
+    }
+    if add {
+        tags.push(tag.to_string());
+    } else {
+        tags.retain(|t| t.to_ascii_lowercase() != lower);
+    }
+    // Patch `tags:` as a sequence block directly (single-item lists included
+    // — a scalar `set_str` path would quote them), or drop the whole block
+    // when the last tag goes. Either way only `tags:` is rewritten, so
+    // comments and unknown keys survive.
+    let body = document.body().to_string();
+    if tags.is_empty() {
+        document.frontmatter.remove_key("tags")?;
+    } else {
+        let block = tags
+            .iter()
+            .map(|t| format!("- {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        document.frontmatter.set_block("tags", &block)?;
+    }
+    let raw = oca_markdown::with_body(&document, &body);
+    core.execute(CoreCommand::SaveDocument {
+        doc: rel.clone(),
+        raw,
+    })?;
+    if add {
+        println!("tagged {} → {tag}", rel.display());
+    } else if tags.is_empty() {
+        println!("removed {tag} (no tags left)");
+    } else {
+        println!("removed {tag} from {}", rel.display());
+    }
+    Ok(0)
+}
+
+/// `namespace:value` or a bare word; letters/digits/`_`/`-` only, at most
+/// one `:` — so a tag can never smuggle YAML syntax into a frontmatter
+/// patch.
+fn validate_tag(tag: &str) -> Result<()> {
+    let parts: Vec<&str> = tag.split(':').collect();
+    let ok = parts.len() <= 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        && !tag.starts_with('-');
+    if !ok {
+        bail!(
+            "invalid tag {tag:?} — expected `namespace:value` or a bare word \
+             (letters, digits, `_`, `-`)"
+        );
+    }
+    Ok(())
+}
+
+/// `oca links <id-or-title>` — outgoing references and backlinks. Links are
+/// by id (§4.1); titles are resolved through the index as a convenience.
+fn links(target: &str, project: Option<&Path>) -> Result<u8> {
+    let mut core = story_core(project)?;
+    // `.md` documents resolve by id or title; songs/takes/events only by id.
+    let (id, title, rel) = match core.resolve(target) {
+        Ok(rel) => {
+            let document = core.read_document(&rel)?;
+            let id = document
+                .frontmatter
+                .get_str("id")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} has no `id:` in its frontmatter — add one (links are by id, \
+                         never path)",
+                        rel.display()
+                    )
+                })?;
+            let title = document
+                .frontmatter
+                .get_str("title")
+                .unwrap_or_else(|| target.to_string());
+            (id, title, rel)
+        }
+        Err(_) => {
+            let (rel, title, kind) = core.unit_by_ref(target).ok().flatten().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "nothing resolves to {target:?} — pass a document id/title, or an id \
+                     of a song/take/event (see `oca search`)"
+                )
+            })?;
+            (target.to_string(), format!("{title} ({kind})"), rel)
+        }
+    };
+    let report = core.link_report(&id)?;
+    println!("{title} — {id}  [{}]", rel.display());
+    if report.outgoing.is_empty() {
+        println!("  no outgoing references");
+    } else {
+        for (kind, to) in &report.outgoing {
+            println!(
+                "  → {kind}: {} ({})  [{}]",
+                to.title,
+                if to.id.is_empty() { "?" } else { &to.id },
+                to.rel.display()
+            );
+        }
+    }
+    if report.incoming.is_empty() {
+        println!("  no backlinks");
+    } else {
+        for (kind, from) in &report.incoming {
+            println!(
+                "  ← {kind}: {} ({})  [{}]",
+                from.title,
+                if from.id.is_empty() { "?" } else { &from.id },
+                from.rel.display()
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// Registered file-format migrations `(to_version, description)`, run in
+/// order by `oca migrate`. Empty until a format newer than 1 exists —
+/// format 1 was the first shipped, so nothing older needs converting. The
+/// *database* schema migrates itself whenever the cache DB opens.
+const FILE_MIGRATIONS: &[(u64, &str)] = &[];
+
+fn migrate(project: Option<&Path>) -> Result<u8> {
+    let root = find_project(project)?;
+    let path = root.join(oca_storage::layout::PROJECT_FILE);
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let meta = oca_model::ProjectMeta::parse(&raw)?;
+    let found = meta.format_version();
+    let supported = oca_model::SUPPORTED_FORMAT_VERSION;
+    if found > supported {
+        bail!(
+            "project format_version {found} is newer than this build supports ({supported}) \
+             — upgrade OCA to migrate it"
+        );
+    }
+    let core = open_core(&root)?; // holds the single-writer lock while we patch
+    if found == supported {
+        println!("project format {found} is current — nothing to migrate");
+    } else {
+        for (version, what) in FILE_MIGRATIONS {
+            if *version > found {
+                println!("applying format {version}: {what}");
+            }
+        }
+        // The one step from a pre-versioned layout (version reads as 0
+        // when `format_version:` is absent): stamp it. Lossless — only that
+        // key is touched.
+        let mut yaml = oca_model::LosslessYaml::new(&raw);
+        yaml.set_str("format_version", &supported.to_string())?;
+        oca_storage::atomic::atomic_write(&path, yaml.raw().as_bytes())?;
+        println!("migrated format {found} → {supported}");
+    }
+    if let Some(t) = core.index_totals() {
+        println!(
+            "cache index: {} documents, {} units — schema current",
+            t.documents, t.units
+        );
+    }
+    Ok(0)
 }

@@ -11,6 +11,9 @@ use anyhow::Result;
 use oca_model::{Document, DocumentKind, ProjectKind, ProjectMeta};
 use oca_storage::Project;
 
+/// Re-export so frontends can hold search/link results without a direct
+/// storage dependency for the types flowing through Core.
+pub use oca_storage::db::{Hit, LinkEnd, LinkReport, ReindexStats, TagCount, Totals};
 /// Re-export so higher layers (story/music engines) can read the document
 /// index through Core without depending on storage directly.
 pub use oca_storage::index::DocEntry;
@@ -256,6 +259,78 @@ impl Core {
 
     pub fn refresh_index(&mut self) -> Result<()> {
         self.project_mut()?.refresh_index()
+    }
+
+    // ---- cache index (Phase 5): search, tags, links, rebuild ---------------
+
+    /// Full-text search over every indexed entity, or a `tag:ns:value` tag
+    /// lookup. Fails with a pointer at `oca reindex` when no cache DB is
+    /// available — never affects editing (files are canonical).
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<oca_storage::db::Hit>> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+        project.search(query, limit)
+    }
+
+    /// Rebuild the whole cache index from the filesystem.
+    pub fn reindex(&mut self) -> Result<oca_storage::db::ReindexStats> {
+        self.project_mut()?.reindex_all()
+    }
+
+    /// Incremental refresh — only files that changed on disk are reparsed
+    /// (the TUI calls this on an idle tick; external edits surface here).
+    pub fn reconcile(&mut self) -> Result<oca_storage::db::ReindexStats> {
+        self.project_mut()?.reconcile()
+    }
+
+    /// Row counts for `doctor` / `reindex` output (`None` = no project or
+    /// no cache DB).
+    pub fn index_totals(&self) -> Option<oca_storage::db::Totals> {
+        self.project
+            .as_ref()
+            .and_then(|p| p.db())
+            .and_then(|db| db.totals().ok())
+    }
+
+    /// Every tag in use with document counts.
+    pub fn tags(&self) -> Result<Vec<oca_storage::db::TagCount>> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+        let db = project
+            .db()
+            .ok_or_else(|| anyhow::anyhow!("cache index unavailable — run `oca reindex`"))?;
+        db.tags()
+    }
+
+    /// Outgoing references + backlinks for a document id (ids come from
+    /// `resolve` + `peek`; links never use paths).
+    pub fn link_report(&self, id: &str) -> Result<oca_storage::db::LinkReport> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+        let db = project
+            .db()
+            .ok_or_else(|| anyhow::anyhow!("cache index unavailable — run `oca reindex`"))?;
+        db.links(id)
+    }
+
+    /// The `(rel, title, kind)` of the first index unit carrying `id` —
+    /// songs, takes, and events that aren't `.md` documents and so can't be
+    /// resolved through the in-memory file index.
+    pub fn unit_by_ref(&self, id: &str) -> Result<Option<(PathBuf, String, String)>> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+        let db = project
+            .db()
+            .ok_or_else(|| anyhow::anyhow!("cache index unavailable — run `oca reindex`"))?;
+        db.unit_by_ref(id)
     }
 }
 

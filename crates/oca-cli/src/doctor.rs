@@ -61,10 +61,41 @@ pub fn collect(
         },
     });
 
-    checks.push(Check {
-        ok: false,
-        label: "Database",
-        detail: phase("SQLite index (FTS5)", "Phase 5"),
+    checks.push(match project_dir {
+        // Opening the cache DB is safe for `doctor`: it only creates or
+        // repairs `.oca/cache/oca.db` (deletable, rebuildable — rule 2).
+        Some(dir) => match oca_storage::db::Db::open(dir) {
+            Ok(db) => match db.totals() {
+                Ok(t) if t.documents == 0 && t.units == 0 => Check {
+                    ok: false,
+                    label: "Database",
+                    detail: "no index yet — run `oca reindex`".into(),
+                },
+                Ok(t) => Check {
+                    ok: true,
+                    label: "Database",
+                    detail: format!(
+                        ".oca/cache/oca.db — {} documents, {} units, {} tags, {} takes",
+                        t.documents, t.units, t.tags, t.takes
+                    ),
+                },
+                Err(err) => Check {
+                    ok: false,
+                    label: "Database",
+                    detail: format!("cache index unreadable ({err:#})"),
+                },
+            },
+            Err(err) => Check {
+                ok: false,
+                label: "Database",
+                detail: format!("cache index unavailable ({err:#})"),
+            },
+        },
+        None => Check {
+            ok: false,
+            label: "Database",
+            detail: "no project here".into(),
+        },
     });
 
     checks.push(Check {

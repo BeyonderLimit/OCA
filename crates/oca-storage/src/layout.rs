@@ -23,6 +23,12 @@ pub const DIRS: &[&str] = &[
     "audio",
     "comments",
     "assets/images",
+];
+
+/// The app's own dirs (cache/state/logs) — everything OCA owns inside a
+/// project. Created on scaffold and re-ensured on open, so a project tree
+/// assembled without `oca new` (adopted, imported, generated) still works.
+pub const APP_DIRS: &[&str] = &[
     ".oca/cache",
     ".oca/state",
     ".oca/state/recovery",
@@ -31,7 +37,15 @@ pub const DIRS: &[&str] = &[
 
 /// Create the empty project tree under `root`.
 pub fn scaffold(root: &Path) -> Result<()> {
-    for dir in DIRS {
+    for dir in DIRS.iter().chain(APP_DIRS) {
+        fs_create(&root.join(dir))?;
+    }
+    Ok(())
+}
+
+/// Create just the `.oca/…` dirs if they're missing (idempotent).
+pub fn ensure_app_dirs(root: &Path) -> Result<()> {
+    for dir in APP_DIRS {
         fs_create(&root.join(dir))?;
     }
     Ok(())
@@ -101,11 +115,25 @@ mod tests {
     fn scaffold_creates_full_layout() {
         let tmp = TempDir::new().unwrap();
         scaffold(tmp.path()).unwrap();
-        for d in DIRS {
+        for d in DIRS.iter().chain(APP_DIRS) {
             assert!(tmp.path().join(d).is_dir(), "missing {d}");
         }
         // precious dirs are state/cache/log locations, never deleted by us
         assert!(tmp.path().join(".oca/state/recovery").is_dir());
+    }
+
+    #[test]
+    fn ensure_app_dirs_alone_is_enough_to_lock() {
+        let tmp = TempDir::new().unwrap();
+        // A tree with content but no `.oca/` (adopted or generated): only
+        // the app dirs appear, content dirs are not invented.
+        std::fs::write(tmp.path().join("project.yaml"), "project_id: prj_x\n").unwrap();
+        ensure_app_dirs(tmp.path()).unwrap();
+        assert!(tmp.path().join(".oca/state").is_dir());
+        assert!(tmp.path().join(".oca/cache").is_dir());
+        assert!(!tmp.path().join("manuscript").exists());
+        // Idempotent.
+        ensure_app_dirs(tmp.path()).unwrap();
     }
 
     #[test]
