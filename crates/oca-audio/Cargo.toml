@@ -1,0 +1,30 @@
+[package]
+name = "oca-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA audio engine: WAV takes, record/playback device abstraction, sidecar metadata, id-based attach"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+cpal.workspace = true
+hound.workspace = true
+oca-core.workspace = true
+oca-model.workspace = true
+oca-music.workspace = true
+oca-story.workspace = true
+oca-storage.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

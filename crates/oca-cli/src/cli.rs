@@ -66,6 +66,13 @@ pub enum Command {
         cmd: SongCommand,
     },
 
+    /// Audio takes: record, play, and link voice notes to chapters and
+    /// songs (Phase 4 — no AI involved).
+    Audio {
+        #[command(subcommand)]
+        cmd: AudioCommand,
+    },
+
     /// Report the health of each OCA subsystem (warnings are informational; exit 0).
     Doctor,
 }
@@ -168,6 +175,94 @@ pub enum SongCommand {
         /// Optional human label recorded in `versions/index.yaml`.
         #[arg(long)]
         label: Option<String>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AudioCommand {
+    /// List every take (title, id, duration, attachment).
+    List {
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Record from the default input device until Enter is pressed.
+    /// (Pause/resume are TUI controls.)
+    Record {
+        /// Take title; also becomes the filename.
+        #[arg(long)]
+        title: Option<String>,
+        /// Attach after saving: `project`, `chapter:<chapter>`, or
+        /// `song:<song>` (validated before recording starts).
+        #[arg(long)]
+        attach: Option<String>,
+        /// Directory for the new take (default: `audio/`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Play a take through the default output device.
+    Play {
+        /// Take id, title, or filename stem.
+        take: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Rename a take's files (the id and every attachment stay).
+    Rename {
+        /// Take id, title, or filename stem.
+        take: String,
+        /// New filename stem (lowercase letters, digits, dashes).
+        stem: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Delete a take's audio and metadata.
+    Delete {
+        /// Take id, title, or filename stem.
+        take: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Link a take to the project, a chapter, or a song.
+    Attach {
+        /// Take id, title, or filename stem.
+        take: String,
+        /// `project`, `chapter:<chapter>`, or `song:<song>`.
+        target: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Remove a take's attachment.
+    Detach {
+        /// Take id, title, or filename stem.
+        take: String,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Edit a take's Creative Note (with no flags: print the current note).
+    Note {
+        /// Take id, title, or filename stem.
+        take: String,
+        /// Note text (replaces the current text).
+        #[arg(long)]
+        text: Option<String>,
+        /// Idea lyric line (replaces the current one).
+        #[arg(long)]
+        lyrics: Option<String>,
+        /// Tempo in BPM (replaces the current one).
+        #[arg(long)]
+        tempo: Option<u32>,
         #[arg(long)]
         project: Option<PathBuf>,
     },

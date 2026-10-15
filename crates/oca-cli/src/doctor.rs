@@ -73,10 +73,21 @@ pub fn collect(
         detail: phase("snapshot versioning", "Phase 6"),
     });
 
-    checks.push(Check {
-        ok: false,
-        label: "Audio subsystem",
-        detail: phase("recording/playback", "Phase 4"),
+    checks.push({
+        let report = oca_audio::Audio::probe(&oca_audio::CpalHost);
+        let input = match &report.input {
+            Ok(spec) => format!("input ✓ {} Hz × {} ch", spec.sample_rate, spec.channels),
+            Err(err) => format!("input unavailable ({err})"),
+        };
+        let output = match &report.output {
+            Ok(spec) => format!("output ✓ {} Hz × {} ch", spec.sample_rate, spec.channels),
+            Err(err) => format!("output unavailable ({err})"),
+        };
+        Check {
+            ok: report.available(),
+            label: "Audio subsystem",
+            detail: format!("{input} · {output}"),
+        }
     });
 
     checks.push(Check {

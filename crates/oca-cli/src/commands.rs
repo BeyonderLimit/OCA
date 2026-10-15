@@ -2,6 +2,7 @@
 //! `oca_core::Core` (AGENTS rule 8; the CLI is the Core's first client).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use oca_core::{Command as CoreCommand, Core, Event};
@@ -9,7 +10,7 @@ use oca_model::{DocumentKind, ProjectKind};
 use oca_music::CheckReport;
 use oca_storage::registry::Registry;
 
-use crate::cli::{ChapterCommand, Command, SongCommand, StoryCommand};
+use crate::cli::{AudioCommand, ChapterCommand, Command, SongCommand, StoryCommand};
 
 pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
     match cmd {
@@ -19,6 +20,7 @@ pub fn dispatch(cmd: Command, home: Option<&Path>) -> Result<u8> {
         Command::Chapter { cmd } => chapter(cmd),
         Command::Story { cmd } => story(cmd),
         Command::Song { cmd } => song(cmd),
+        Command::Audio { cmd } => audio(cmd),
         Command::Doctor => unreachable!("doctor is dispatched from main"),
     }
 }
@@ -409,5 +411,174 @@ fn print_check(r: &CheckReport) {
                 h.word, h.kind, h.line, h.section
             );
         }
+    }
+}
+
+// ---- audio (Phase 4) -------------------------------------------------------
+
+fn audio(cmd: AudioCommand) -> Result<u8> {
+    match cmd {
+        AudioCommand::List { project } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            print_takes(&facade.takes()?);
+            Ok(0)
+        }
+        AudioCommand::Record {
+            title,
+            attach,
+            dir,
+            project,
+        } => {
+            let root = find_project(project.as_deref())?;
+            let core = open_core(&root)?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            // Resolve the attach target BEFORE recording, so a typo costs
+            // nothing but a retype.
+            let target = match attach {
+                Some(spec) => Some(facade.resolve_target(&spec)?),
+                None => None,
+            };
+            let dir_rel = dir.unwrap_or_else(oca_audio::default_take_dir);
+            let recorder = facade.record()?;
+            println!(
+                "recording ({} Hz, {} channel(s)) — press Enter to stop",
+                recorder.spec().sample_rate,
+                recorder.spec().channels
+            );
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("cannot read the stop signal")?;
+            let done = recorder.stop();
+            let take = facade.save_take(&done, &dir_rel, title.as_deref())?;
+            let take = match target {
+                Some(target) => facade.attach(&take, &target)?,
+                None => take,
+            };
+            println!(
+                "saved {} ({}, {:.1}s)",
+                take.stem(),
+                take.meta.take_id,
+                take.duration_secs()
+            );
+            if let Some(attached) = &take.meta.attached {
+                println!("attached to {}", attached.describe());
+            }
+            Ok(0)
+        }
+        AudioCommand::Play { take, project } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            let take = facade.take(&take)?;
+            println!("playing {} ({:.1}s)", take.stem(), take.duration_secs());
+            let mut player = facade.play(&take)?;
+            player.wait_done()?;
+            Ok(0)
+        }
+        AudioCommand::Rename {
+            take,
+            stem,
+            project,
+        } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            let take = facade.take(&take)?;
+            let renamed = facade.rename(&take, &stem)?;
+            println!(
+                "renamed to {} ({})",
+                renamed.wav_rel.display(),
+                renamed.meta.take_id
+            );
+            Ok(0)
+        }
+        AudioCommand::Delete { take, project } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            let take = facade.take(&take)?;
+            let stem = take.stem();
+            facade.delete(&take)?;
+            println!("deleted {stem}");
+            Ok(0)
+        }
+        AudioCommand::Attach {
+            take,
+            target,
+            project,
+        } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            let take = facade.take(&take)?;
+            let target = facade.resolve_target(&target)?;
+            let take = facade.attach(&take, &target)?;
+            println!(
+                "{} → {}",
+                take.stem(),
+                take.meta.attached.as_ref().unwrap().describe()
+            );
+            Ok(0)
+        }
+        AudioCommand::Detach { take, project } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            let take = facade.take(&take)?;
+            let take = facade.detach(&take)?;
+            println!("{} is unattached", take.stem());
+            Ok(0)
+        }
+        AudioCommand::Note {
+            take,
+            text,
+            lyrics,
+            tempo,
+            project,
+        } => {
+            let core = story_core(project.as_deref())?;
+            let facade = oca_audio::Audio::new(&core, Arc::new(oca_audio::CpalHost))?;
+            let take = facade.take(&take)?;
+            if text.is_none() && lyrics.is_none() && tempo.is_none() {
+                match &take.meta.note {
+                    Some(note) => {
+                        if let Some(t) = &note.text {
+                            println!("text: {t}");
+                        }
+                        if let Some(l) = &note.lyrics {
+                            println!("lyrics: {l}");
+                        }
+                        if let Some(bpm) = note.tempo_bpm {
+                            println!("tempo: {bpm} BPM");
+                        }
+                    }
+                    None => println!("no note on {}", take.stem()),
+                }
+                return Ok(0);
+            }
+            let take = facade.update_note(&take, text.as_deref(), lyrics.as_deref(), tempo)?;
+            println!("updated the note on {}", take.stem());
+            Ok(0)
+        }
+    }
+}
+
+fn print_takes(takes: &[oca_audio::Take]) {
+    if takes.is_empty() {
+        println!("no takes yet — record one with `oca audio record` or in the TUI");
+        return;
+    }
+    for take in takes {
+        let attached = take
+            .meta
+            .attached
+            .as_ref()
+            .map(|a| a.describe())
+            .unwrap_or_else(|| "unattached".into());
+        println!(
+            "{:<24} {:<32} {:>6.1}s  {:<20} {}",
+            take.stem(),
+            take.meta.take_id,
+            take.duration_secs(),
+            attached,
+            take.wav_rel.display()
+        );
     }
 }

@@ -19,6 +19,7 @@ dist = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+oca-audio.workspace = true
 oca-core.workspace = true
 oca-model.workspace = true
 oca-music.workspace = true

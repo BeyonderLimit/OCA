@@ -255,6 +255,39 @@ sense: narrative = events shown in chapters before N (book order); story =
 events whose `story_time` precedes chapter N's frontmatter `story_time:` anchor
 (the target chapter must carry one). `oca story before` defaults to narrative.
 
+### 4.7 Audio takes (sidecar, Phase 4)
+
+A **take** is 16-bit PCM WAV plus a same-stem YAML sidecar — files are
+canonical, so no database row is required until Phase 5 indexes them. Takes
+live in `audio/`, or in `music/songs/<slug>/demos/` for song demos. A bare
+`.wav` without a sidecar is ignored (never auto-adopted: the immutable id is
+the link anchor).
+
+```yaml
+# audio/chorus-idea-7.yaml — fields after take_id are losslessly patchable
+take_id: take_01JB…          # immutable; renaming touches files only
+title: Chorus Idea #7
+created: 2026-10-15T09:00:00Z # RFC 3339
+sample_rate: 44100
+channels: 2
+duration_ms: 4200
+checksum: sha256:…            # A1 snapshot-by-reference contract
+attached:                     # optional — targets resolve via owning engine
+  kind: song                  # chapter | song | project
+  id: song_ashes
+note:                         # optional — Creative Note (§10)
+  text: Needs to feel bigger on the last line.
+  lyrics: "I thought I knew…"
+  tempo: 92
+  melody: {}                  # reserved for future AI; v1 preserves, never writes
+```
+
+Attachment is stored **only** in the sidecar — the chapter/song files are
+never modified — and the id is validated through `oca-story`/`oca-music` at
+read time, so `oca audio attach take song:no-such-song` fails loudly instead
+of leaving a phantom link. `oca audio attach take chapter:8` resolves a
+chapter by number/id/title/path like every other story command.
+
 ---
 
 ## 5. Knowledge layer
@@ -521,6 +554,8 @@ Notes: "Needs to feel bigger on the last line."
 ```
 
 Design the data model now so melody/MIDI fields can be added later without migration pain (v1 does **no** melody extraction).
+
+**What v1 ships (Phase 4):** the take pipeline in §4.7 — record, pause/resume, save, list, play back, attach to chapter/song/project, rename, delete — with takes stored by WAV + sidecar and attachment validated through the owning engines. `note.text`/`note.lyrics`/`note.tempo` are editable; `note.melody` is preserved losslessly but writable only by future AI operations. Dictation (whisper.cpp) and melody extraction are Phase 7B/17 and must not block the offline core.
 
 ---
 

@@ -437,3 +437,178 @@ fn phase3_exit_sample_song_and_language_gate() {
     assert!(out.contains("unsupported"), "got: {out}");
     assert!(!out.contains("total: "), "no syllable total for fr: {out}");
 }
+
+// ---- Phase 4 exit criteria (device-free half) -------------------------------
+
+/// Seed a take exactly the way the recorder writes one: a tiny valid WAV
+/// plus its sidecar. (Recording and playback need real devices; those are
+/// covered by the mock-host engine tests and the manual per-OS checklist.)
+fn seed_take(root: &Path, stem: &str, title: &str, take_id: &str) {
+    std::fs::create_dir_all(root.join("audio")).unwrap();
+    let rate: u32 = 8_000;
+    let data = vec![0u8; 200]; // 100 frames, mono, 16-bit PCM
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+    std::fs::write(root.join(format!("audio/{stem}.wav")), wav).unwrap();
+    std::fs::write(
+        root.join(format!("audio/{stem}.yaml")),
+        format!(
+            "take_id: {take_id}\ntitle: {title}\ncreated: 2026-10-15T09:00:00Z\n\
+             sample_rate: 8000\nchannels: 1\nduration_ms: 12\nchecksum: sha256:seed\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Phase 4 exit (CLI half): list a take, attach it to a chapter and to a
+/// song by id, edit its Creative Note, rename, detach, delete — all offline
+/// from the CLI, sidecar patches lossless.
+#[test]
+fn phase4_exit_take_lifecycle_over_sample_novel() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0001");
+
+    // list: title, id, duration, unattached, path
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["audio", "list"]));
+    assert!(out.contains("voice-memo"), "got: {out}");
+    assert!(out.contains("take_SEED0001"), "got: {out}");
+    assert!(out.contains("unattached"), "got: {out}");
+    assert!(out.contains("audio/voice-memo.wav"), "got: {out}");
+
+    // attach to a chapter — resolved through the story engine, id stored
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["audio", "attach", "voice memo", "chapter:1"],
+    ));
+    assert!(out.contains("chapter ch_001"), "got: {out}");
+    let sidecar = root.join("audio/voice-memo.yaml");
+    let raw = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(raw.contains("kind: chapter"), "{raw}");
+    assert!(raw.contains("id: ch_001"), "{raw}");
+
+    // Creative Note: write fields, then print them back
+    stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &[
+            "audio",
+            "note",
+            "voice-memo",
+            "--text",
+            "needs rain sounds",
+            "--tempo",
+            "88",
+        ],
+    ));
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["audio", "note", "voice-memo"],
+    ));
+    assert!(out.contains("needs rain sounds"), "got: {out}");
+    assert!(out.contains("88"), "got: {out}");
+
+    // re-attach to the song (last write wins)
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["audio", "attach", "voice-memo", "song:ashes"],
+    ));
+    assert!(out.contains("song song_ashes"), "got: {out}");
+    let raw = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(raw.contains("kind: song"), "{raw}");
+    assert!(raw.contains("id: song_ashes"), "{raw}");
+    // The note survived the re-attach (only `attached:` was patched).
+    assert!(raw.contains("needs rain sounds"), "{raw}");
+
+    // rename: files move, take_id (and its links) do not
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["audio", "rename", "voice-memo", "field-recording"],
+    ));
+    assert!(out.contains("take_SEED0001"), "got: {out}");
+    assert!(!sidecar.exists(), "old sidecar moved");
+    let raw = std::fs::read_to_string(root.join("audio/field-recording.yaml")).unwrap();
+    assert!(raw.contains("take_id: take_SEED0001"), "{raw}");
+    assert!(raw.contains("kind: song"), "attachment followed the rename");
+
+    // detach clears only the attachment
+    let out = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["audio", "detach", "field-recording"],
+    ));
+    assert!(out.contains("unattached"), "got: {out}");
+    let raw = std::fs::read_to_string(root.join("audio/field-recording.yaml")).unwrap();
+    assert!(!raw.contains("attached"), "{raw}");
+    assert!(raw.contains("needs rain sounds"), "{raw}");
+
+    // delete removes both files
+    stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["audio", "delete", "field-recording"],
+    ));
+    let out = stdout_of(&run_in(&home, tmp.path(), &root, &["audio", "list"]));
+    assert!(out.contains("no takes yet"), "got: {out}");
+}
+
+/// Phase 4: clean error paths — unknown take, unknown chapter, malformed
+/// target — all exit non-zero with a helpful message (no device access).
+#[test]
+fn phase4_audio_errors_are_reported_not_crashed() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0001");
+
+    let cases: &[&[&str]] = &[
+        &["audio", "attach", "no-such-take", "project"],
+        &["audio", "attach", "voice-memo", "chapter:no-such-thing"],
+        &["audio", "attach", "voice-memo", "alien:xyz"],
+        &["audio", "attach", "voice-memo", "nonsense"],
+        // Record validates its --attach target BEFORE opening a device,
+        // so this fails identically with and without sound hardware.
+        &["audio", "record", "--attach", "chapter:no-such-thing"],
+        &["audio", "play", "no-such-take"],
+        &["audio", "rename", "voice-memo", "!!!"],
+        &["audio", "delete", "no-such-take"],
+        &["audio", "detach", "no-such-take"],
+        &["audio", "note", "no-such-take", "--text", "x"],
+    ];
+    for args in cases {
+        let out = run_in(&home, tmp.path(), &root, args);
+        assert!(
+            !out.status.success(),
+            "expected failure: {args:?}\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.trim().is_empty(), "failure explains itself: {args:?}");
+    }
+}

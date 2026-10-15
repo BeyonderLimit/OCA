@@ -165,6 +165,29 @@ impl LosslessYaml {
         Ok(())
     }
 
+    /// Remove a top-level key and its whole value block, leaving every other
+    /// byte untouched (comments, unknown keys, ordering). Removing a key
+    /// that isn't present is a no-op — clearing an optional block is the
+    /// motivating case.
+    pub fn remove_key(&mut self, key: &str) -> Result<()> {
+        let lines: Vec<&str> = self.raw.split('\n').collect();
+        let Some(key_line) = find_key_line(&lines, key) else {
+            return Ok(());
+        };
+        let end = value_block_end(&lines, key_line);
+        let mut out = String::new();
+        if key_line > 0 {
+            out.push_str(&lines[..key_line].join("\n"));
+            out.push('\n');
+        }
+        out.push_str(&lines[end..].join("\n"));
+        if !self.raw.ends_with('\n') && out.ends_with('\n') {
+            out.pop();
+        }
+        self.raw = out;
+        Ok(())
+    }
+
     /// Set a top-level scalar, patching only that key's lines. Existing value
     /// block is replaced in place; a missing key is appended at the end.
     pub fn set_str(&mut self, key: &str, value: &str) -> Result<()> {
@@ -417,5 +440,35 @@ mod tests {
         y.set_str("t", "with: colon").unwrap();
         assert_eq!(y.raw(), "t: 'with: colon'\n");
         assert_eq!(y.get_str("t").as_deref(), Some("with: colon"));
+    }
+
+    #[test]
+    fn remove_key_drops_only_that_block() {
+        let mut y = LosslessYaml::new(
+            "take_id: take_1\nattached:\n  kind: chapter\n  id: ch_9\n# keep me\nnote:\n  text: hi\n",
+        );
+        y.remove_key("attached").unwrap();
+        assert_eq!(
+            y.raw(),
+            "take_id: take_1\n# keep me\nnote:\n  text: hi\n",
+            "block gone, comments and other keys byte-identical"
+        );
+        assert!(y.get_value("attached").is_none());
+        assert_eq!(y.get_str("note").as_deref(), Some("text: hi"));
+    }
+
+    #[test]
+    fn remove_key_is_a_no_op_when_absent() {
+        let mut y = LosslessYaml::new("a: 1\n");
+        y.remove_key("nope").unwrap();
+        assert_eq!(y.raw(), "a: 1\n");
+    }
+
+    #[test]
+    fn remove_last_key_leaves_valid_yaml() {
+        let mut y = LosslessYaml::new("a: 1\nattached:\n  kind: project\n");
+        y.remove_key("attached").unwrap();
+        assert_eq!(y.raw(), "a: 1\n");
+        assert!(serde_yaml::from_str::<serde_yaml::Mapping>(y.raw()).is_ok());
     }
 }

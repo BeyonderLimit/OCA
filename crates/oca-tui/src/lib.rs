@@ -8,6 +8,7 @@ pub use app::App;
 pub use editor::{Editor, KeyOutcome};
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -19,6 +20,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use oca_audio::CpalHost;
 use oca_core::Core;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -51,7 +53,7 @@ pub fn run(core: &mut Core) -> Result<()> {
     let _guard = TermGuard;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let mut app = App::new(core);
+    let mut app = App::new(core, Arc::new(CpalHost));
     loop {
         terminal.draw(|frame| app.draw(core, frame))?;
         if app.should_quit() {

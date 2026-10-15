@@ -2,10 +2,12 @@
 //! Reads through Core queries, writes through Core commands — nothing else.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use oca_audio::{Audio, AudioHost, Player, RecState, Recorder, Take, default_take_dir};
 use oca_core::{Command, Core, RecoveryEntry};
 use oca_model::DocumentKind;
 use oca_music::{CursorMetrics, EnglishPhonetics, Music, cursor_metrics, section_marks};
@@ -32,6 +34,8 @@ enum Focus {
     Editor,
     /// The "set state at this chapter" form is capturing input.
     Form,
+    /// The audio panel (take list + record controls) is open.
+    Audio,
 }
 
 enum TreeItem {
@@ -63,6 +67,49 @@ impl StateForm {
     }
 }
 
+/// What a take recorded from the current context should link to, and where
+/// its file lands. Derived from the open document; the engine resolves and
+/// validates the actual target (rule 8).
+enum AttachContext {
+    /// Open chapter — key is its project-relative path.
+    Chapter(String),
+    /// Open song — key is its slug.
+    Song(String),
+    /// No relevant document open: project-level voice note.
+    Project,
+}
+
+impl AttachContext {
+    fn describe(&self) -> String {
+        match self {
+            AttachContext::Chapter(rel) => format!("chapter {rel}"),
+            AttachContext::Song(slug) => format!("song {slug}"),
+            AttachContext::Project => "project".into(),
+        }
+    }
+
+    /// The spec `Audio::resolve_target` understands.
+    fn target_spec(&self) -> String {
+        match self {
+            AttachContext::Chapter(rel) => format!("chapter:{rel}"),
+            AttachContext::Song(slug) => format!("song:{slug}"),
+            AttachContext::Project => "project".into(),
+        }
+    }
+}
+
+/// Open state of the audio panel: the take list, the selection, and any
+/// live recorder/player. All behavior lives in `oca-audio` (rule 8).
+struct AudioPanel {
+    /// Directory new takes are saved into (context-dependent).
+    dir_rel: PathBuf,
+    ctx: AttachContext,
+    takes: Vec<Take>,
+    sel: usize,
+    rec: Option<Recorder>,
+    player: Option<Player>,
+}
+
 enum Banner {
     /// A journaled draft differs from the file on disk.
     Recovery { entry: RecoveryEntry },
@@ -92,6 +139,10 @@ pub struct App {
     song: Option<SongCtx>,
     /// Live status-bar metrics for the cursor position (lyrics only).
     song_metrics: Option<CursorMetrics>,
+    /// Device access for the audio panel (tests inject a mock host).
+    audio_host: Arc<dyn AudioHost>,
+    /// Present while the audio panel is open.
+    audio_panel: Option<AudioPanel>,
     last_journal: Instant,
     quit: bool,
     /// Last drawn inner editor rect (mouse mapping); sane default pre-draw.
@@ -100,7 +151,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(core: &Core) -> Self {
+    pub fn new(core: &Core, audio_host: Arc<dyn AudioHost>) -> Self {
         let items = build_items(core);
         let sel = next_selectable(&items, 0, 1).unwrap_or(0);
         let status = if core.is_read_only() {
@@ -123,6 +174,8 @@ impl App {
             form: None,
             song: None,
             song_metrics: None,
+            audio_host,
+            audio_panel: None,
             last_journal: Instant::now(),
             quit: false,
             editor_area: Rect::new(0, 0, 72, 24),
@@ -406,7 +459,214 @@ impl App {
 
     pub fn tick(&mut self, core: &mut Core) -> Result<()> {
         self.journal_now(core, false);
+        // Retire finished playback so the panel stops saying "playing".
+        if let Some(panel) = &mut self.audio_panel
+            && let Some(player) = &panel.player
+            && player.is_done()
+        {
+            panel.player = None;
+        }
         Ok(())
+    }
+
+    // ---- audio panel (Phase 4) --------------------------------------------
+
+    /// Where a new take lands and what it should attach to, given the open
+    /// document: a song's lyrics file → that song's `demos/`; a chapter or
+    /// nothing → the project `audio/` directory.
+    fn audio_context(open_rel: Option<&Path>) -> (PathBuf, AttachContext) {
+        match open_rel {
+            Some(rel) if group_of(rel) == "manuscript" => (
+                default_take_dir(),
+                AttachContext::Chapter(rel.to_string_lossy().into_owned()),
+            ),
+            Some(rel) if group_of(rel) == "music" => {
+                let comps: Vec<Component> = rel.components().collect();
+                if comps.len() == 4 {
+                    // music/songs/<slug>/lyrics.md
+                    let slug = comps[2].as_os_str().to_string_lossy().into_owned();
+                    let dir = PathBuf::from("music/songs").join(&slug).join("demos");
+                    (dir, AttachContext::Song(slug))
+                } else {
+                    (default_take_dir(), AttachContext::Project)
+                }
+            }
+            _ => (default_take_dir(), AttachContext::Project),
+        }
+    }
+
+    fn open_audio_panel(&mut self, core: &Core) {
+        let (dir_rel, ctx) = Self::audio_context(self.open_rel.as_deref());
+        let mut panel = AudioPanel {
+            dir_rel,
+            ctx,
+            takes: Vec::new(),
+            sel: 0,
+            rec: None,
+            player: None,
+        };
+        let host = Arc::clone(&self.audio_host);
+        if let Ok(audio) = Audio::new(core, host) {
+            match audio.takes() {
+                Ok(takes) => panel.takes = takes,
+                Err(e) => {
+                    self.status = format!("cannot list takes: {e}");
+                    self.audio_panel = Some(panel);
+                    self.focus = Focus::Audio;
+                    return;
+                }
+            }
+        }
+        self.status = format!(
+            "audio — new takes go to {} · attach to {}",
+            panel.dir_rel.display(),
+            panel.ctx.describe()
+        );
+        self.audio_panel = Some(panel);
+        self.focus = Focus::Audio;
+    }
+
+    fn audio_key(&mut self, core: &Core, key: KeyEvent) {
+        let Some(mut panel) = self.audio_panel.take() else {
+            return;
+        };
+        let host = Arc::clone(&self.audio_host);
+        let audio = match Audio::new(core, host) {
+            Ok(audio) => audio,
+            Err(e) => {
+                self.status = format!("audio: {e}");
+                self.audio_panel = Some(panel);
+                return;
+            }
+        };
+        match key.code {
+            KeyCode::Esc => {
+                if panel.rec.is_some() {
+                    // Never lose a recording to a closed panel: save it,
+                    // then drop the panel (it was taken out above).
+                    let _saved = self.stop_and_save(core, panel);
+                    self.focus = Focus::Tree;
+                    self.status.push_str(" — panel closed");
+                    return;
+                }
+                // Panel was taken out above; not storing it back closes it.
+                self.focus = Focus::Tree;
+                self.status = "audio closed".into();
+                return;
+            }
+            KeyCode::Char('r') if panel.rec.is_none() => match audio.record() {
+                Ok(rec) => {
+                    panel.rec = Some(rec);
+                    self.status = "recording — p pause · s save · Esc saves and closes".into();
+                }
+                Err(e) => self.status = format!("cannot record: {e}"),
+            },
+            KeyCode::Char('p') => {
+                if let Some(rec) = &mut panel.rec {
+                    match rec.state() {
+                        RecState::Recording => match rec.pause() {
+                            Ok(()) => self.status = "recording paused".into(),
+                            Err(e) => self.status = format!("cannot pause: {e}"),
+                        },
+                        RecState::Paused => match rec.resume() {
+                            Ok(()) => self.status = "recording resumed".into(),
+                            Err(e) => self.status = format!("cannot resume: {e}"),
+                        },
+                    }
+                }
+            }
+            KeyCode::Char('s') if panel.rec.is_some() => {
+                panel = self.stop_and_save(core, panel);
+            }
+            KeyCode::Enter => {
+                if let Some(take) = panel.takes.get(panel.sel).cloned() {
+                    match audio.play(&take) {
+                        Ok(player) => {
+                            panel.player = Some(player);
+                            self.status = format!("playing {}", take.stem());
+                        }
+                        Err(e) => self.status = format!("cannot play: {e}"),
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(take) = panel.takes.get(panel.sel).cloned() {
+                    let spec = panel.ctx.target_spec();
+                    match audio
+                        .resolve_target(&spec)
+                        .and_then(|target| audio.attach(&take, &target))
+                    {
+                        Ok(updated) => {
+                            self.status = format!(
+                                "{} → {}",
+                                updated.stem(),
+                                updated
+                                    .meta
+                                    .attached
+                                    .as_ref()
+                                    .map(|a| a.describe())
+                                    .unwrap_or_default()
+                            );
+                            panel.takes[panel.sel] = updated;
+                        }
+                        Err(e) => self.status = format!("cannot attach: {e}"),
+                    }
+                }
+            }
+            KeyCode::Char('d') if panel.rec.is_none() => {
+                if let Some(take) = panel.takes.get(panel.sel).cloned() {
+                    match audio.delete(&take) {
+                        Ok(()) => {
+                            panel.takes.remove(panel.sel);
+                            panel.sel = panel.sel.min(panel.takes.len().saturating_sub(1));
+                            self.status = format!("deleted {}", take.stem());
+                        }
+                        Err(e) => self.status = format!("cannot delete: {e}"),
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if panel.sel + 1 < panel.takes.len() {
+                    panel.sel += 1;
+                }
+            }
+            KeyCode::Up => {
+                panel.sel = panel.sel.saturating_sub(1);
+            }
+            _ => {}
+        }
+        self.audio_panel = Some(panel);
+    }
+
+    /// Stop the active recording and save it into the panel's directory,
+    /// selecting the new take. Returns the panel for the caller to store.
+    fn stop_and_save(&mut self, core: &Core, mut panel: AudioPanel) -> AudioPanel {
+        let Some(rec) = panel.rec.take() else {
+            return panel;
+        };
+        let done = rec.stop();
+        let host = Arc::clone(&self.audio_host);
+        let audio = match Audio::new(core, host) {
+            Ok(audio) => audio,
+            Err(e) => {
+                self.status = format!("cannot save recording: {e}");
+                return panel;
+            }
+        };
+        match audio.save_take(&done, &panel.dir_rel, None) {
+            Ok(take) => {
+                panel.takes.push(take);
+                panel.sel = panel.takes.len() - 1;
+                let sel = panel.sel;
+                self.status = format!(
+                    "saved {} — Enter plays · a attaches to {}",
+                    panel.takes[sel].stem(),
+                    panel.ctx.describe()
+                );
+            }
+            Err(e) => self.status = format!("cannot save recording: {e}"),
+        }
+        panel
     }
 
     // ---- input -----------------------------------------------------------
@@ -467,6 +727,7 @@ impl App {
             Focus::Tree => self.tree_key(core, key),
             Focus::Editor => self.editor_key(key),
             Focus::Form => self.form_key(core, key),
+            Focus::Audio => self.audio_key(core, key),
         }
         Ok(())
     }
@@ -520,6 +781,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_state_form(),
+            KeyCode::Char('a') | KeyCode::Char('A') => self.open_audio_panel(core),
             KeyCode::Tab if self.open_rel.is_some() => {
                 self.focus = Focus::Editor;
             }
@@ -614,6 +876,7 @@ impl App {
         self.draw_editor(frame, cols[1]);
         self.draw_status(core, frame, rows[1]);
         self.draw_form(frame);
+        self.draw_audio(frame);
     }
 
     fn draw_tree(&self, frame: &mut Frame, area: Rect) {
@@ -719,6 +982,69 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Centered popup listing takes with record/play controls.
+    fn draw_audio(&self, frame: &mut Frame) {
+        let Some(panel) = &self.audio_panel else {
+            return;
+        };
+        let area = centered(frame.area(), 78, 18);
+        let rec_badge = match &panel.rec {
+            Some(rec) => match rec.state() {
+                RecState::Recording => "  ● RECORDING".to_string(),
+                RecState::Paused => "  ● PAUSED".to_string(),
+            },
+            None => String::new(),
+        };
+        let playing = if panel.player.is_some() { "  ♪" } else { "" };
+        let block = Block::default().borders(Borders::ALL).title(format!(
+            " Audio — {}{rec_badge}{playing} ",
+            panel.dir_rel.display()
+        ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::styled(
+                format!("new takes attach to: {}", panel.ctx.describe()),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Line::from(""),
+        ];
+        if panel.takes.is_empty() {
+            lines.push(Line::styled(
+                "no takes yet — press r to record",
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+        for (i, take) in panel.takes.iter().enumerate() {
+            let marker = if i == panel.sel { "▶ " } else { "  " };
+            let attached = take
+                .meta
+                .attached
+                .as_ref()
+                .map(|a| a.describe())
+                .unwrap_or_else(|| "—".into());
+            let note = if take.meta.note.is_some() { " ✎" } else { "" };
+            let line = Line::from(format!(
+                "{marker}{:<22} {:>5.1}s  {}{note}",
+                truncate(&take.stem(), 22),
+                take.duration_secs(),
+                attached
+            ));
+            lines.push(if i == panel.sel {
+                line.style(SELECTED_STYLE)
+            } else {
+                line
+            });
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "↑↓ select · Enter play · a attach · d delete · r record · p pause · s save · Esc close",
+            Style::new().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_status(&self, core: &Core, frame: &mut Frame, area: Rect) {
         let line1 = if let Some(Banner::Recovery { entry }) = &self.banner {
             Line::from(vec![
@@ -748,9 +1074,12 @@ impl App {
             }
             Focus::Editor => " Tab/ Esc tree · Ctrl-S save · Ctrl-N chapter · Ctrl-Q quit",
             Focus::Tree => {
-                " ↑↓ select · Enter open · S state · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
+                " ↑↓ select · Enter open · S state · A audio · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Form => " Tab field · Enter apply · Esc cancel",
+            Focus::Audio => {
+                " ↑↓ select · Enter play · a attach · d delete · r record · p pause · s save · Esc close"
+            }
         };
         let line2 = Line::from(Span::styled(hints, Style::new().fg(Color::DarkGray)));
         frame.render_widget(Paragraph::new(vec![line1, line2]), area);
@@ -846,6 +1175,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oca_audio::MockHost;
     use oca_core::Event;
     use oca_model::ProjectKind;
     use ratatui::Terminal;
@@ -886,7 +1216,7 @@ mod tests {
     fn tree_lists_documents_and_enter_opens() {
         let tmp = TempDir::new().unwrap();
         let (mut core, rel) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
 
         assert_eq!(app.items.len(), 2, "group + one document");
         assert!(matches!(app.items[app.sel], TreeItem::Doc { .. }));
@@ -901,7 +1231,7 @@ mod tests {
     fn typing_then_ctrl_s_writes_through_core() {
         let tmp = TempDir::new().unwrap();
         let (mut core, rel) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
 
         for c in "It begins.".chars() {
@@ -926,7 +1256,7 @@ mod tests {
         let (mut core, rel) = project_with_chapter(&tmp);
 
         // Session 1: open, type, save, quit, close.
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         for c in "Session one wrote this.".chars() {
             app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
@@ -945,7 +1275,7 @@ mod tests {
             root: tmp.path().to_path_buf(),
         })
         .unwrap();
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         assert!(
             app.editor.text().contains("Session one wrote this."),
@@ -982,7 +1312,7 @@ mod tests {
     fn ctrl_q_quits_and_journals_dirty_draft() {
         let tmp = TempDir::new().unwrap();
         let (mut core, rel) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         for c in "unsaved thoughts".chars() {
             app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
@@ -1003,7 +1333,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         assert!(app.banner.is_some(), "differing draft must show a banner");
         assert!(app.status.contains("opened"));
@@ -1017,7 +1347,7 @@ mod tests {
         // And a second run: discard path.
         app.on_key(&mut core, ctrl('q')).unwrap();
         drop(app);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         assert!(app.banner.is_some());
         app.on_key(&mut core, key(KeyCode::Char('d'))).unwrap();
@@ -1048,7 +1378,7 @@ mod tests {
             root: tmp.path().to_path_buf(),
         })
         .unwrap();
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         assert!(
             app.status.contains("another session"),
             "status: {}",
@@ -1069,7 +1399,7 @@ mod tests {
     fn ctrl_n_creates_chapter_and_opens_it() {
         let tmp = TempDir::new().unwrap();
         let (mut core, _) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, ctrl('n')).unwrap();
         assert_eq!(app.items.len(), 3, "group now has two documents");
         assert!(
@@ -1085,7 +1415,7 @@ mod tests {
     fn draws_without_panic_via_test_backend() {
         let tmp = TempDir::new().unwrap();
         let (mut core, _) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         for c in "some text".chars() {
             app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
@@ -1103,7 +1433,7 @@ mod tests {
     fn paste_inserts_when_editor_focused() {
         let tmp = TempDir::new().unwrap();
         let (mut core, rel) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         app.on_paste(&mut core, "pasted chunk");
         assert!(app.dirty);
@@ -1132,7 +1462,7 @@ mod tests {
     fn set_state_form_applies_state_through_story_engine() {
         let tmp = TempDir::new().unwrap();
         let (mut core, chapter_rel, char_rel) = project_with_chapter_and_character(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
 
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap(); // open the chapter
         app.on_key(&mut core, key(KeyCode::Tab)).unwrap(); // back to the tree
@@ -1173,7 +1503,7 @@ mod tests {
     fn set_state_form_guards_and_cancels_without_writing() {
         let tmp = TempDir::new().unwrap();
         let (mut core, _chapter, char_rel) = project_with_chapter_and_character(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
 
         // Character selected but no chapter open: refused with a reason.
         app.on_key(&mut core, key(KeyCode::Down)).unwrap();
@@ -1225,7 +1555,7 @@ mod tests {
     fn form_renders_over_the_frame() {
         let tmp = TempDir::new().unwrap();
         let (mut core, _chapter, _char) = project_with_chapter_and_character(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         app.on_key(&mut core, key(KeyCode::Tab)).unwrap();
         app.on_key(&mut core, key(KeyCode::Down)).unwrap();
@@ -1263,7 +1593,7 @@ hold on to the light
         })
         .unwrap();
 
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.open_doc(&mut core, entry.lyrics_rel.clone());
         assert!(app.song.is_some(), "lyrics.md wires up the song context");
 
@@ -1331,12 +1661,182 @@ hold on to the light
     fn chapters_have_no_song_context() {
         let tmp = TempDir::new().unwrap();
         let (mut core, _rel) = project_with_chapter(&tmp);
-        let mut app = App::new(&core);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
         app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
         assert!(app.song.is_none());
         assert!(app.song_metrics.is_none());
         let before = app.editor.cursor();
         app.on_key(&mut core, alt(']')).unwrap();
         assert_eq!(app.editor.cursor(), before, "Alt-] is inert in chapters");
+    }
+
+    /// Phase 4: from a chapter, the audio panel records → pause → resume →
+    /// saves into `audio/`, attaches to the chapter by id, plays back, and
+    /// closes — every rule enforced by `oca-audio` (rule 8).
+    #[test]
+    fn audio_panel_records_saves_and_attaches_to_the_open_chapter() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        let host = Arc::new(MockHost::with_chunks(
+            oca_audio::AudioSpec::mono(8_000),
+            vec![vec![0.1; 40], vec![0.2; 40]],
+        ));
+        let mut app = App::new(&core, host.clone());
+        app.open_doc(&mut core, rel.clone());
+
+        // Tree → A opens the panel in the chapter's context.
+        app.focus = Focus::Tree;
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        assert_eq!(app.focus, Focus::Audio);
+        {
+            let panel = app.audio_panel.as_ref().unwrap();
+            assert!(matches!(panel.ctx, AttachContext::Chapter(_)));
+            assert_eq!(panel.dir_rel, PathBuf::from("audio"));
+            assert!(panel.takes.is_empty());
+        }
+
+        // record → pause → resume → save
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        assert!(app.audio_panel.as_ref().unwrap().rec.is_some());
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        assert_eq!(
+            app.audio_panel
+                .as_ref()
+                .unwrap()
+                .rec
+                .as_ref()
+                .unwrap()
+                .state(),
+            RecState::Paused
+        );
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        assert_eq!(
+            app.audio_panel
+                .as_ref()
+                .unwrap()
+                .rec
+                .as_ref()
+                .unwrap()
+                .state(),
+            RecState::Recording
+        );
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        {
+            let panel = app.audio_panel.as_ref().unwrap();
+            assert!(panel.rec.is_none(), "s stop clears the recorder");
+            assert_eq!(panel.takes.len(), 1);
+            assert_eq!(panel.takes[0].wav_rel, PathBuf::from("audio/take-001.wav"));
+            assert_eq!(panel.takes[0].meta.duration_ms, 10, "80 frames @ 8 kHz");
+        }
+        assert!(tmp.path().join("audio/take-001.wav").is_file());
+
+        // Attach: the sidecar records the chapter's immutable id.
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        let doc = core.read_document(&rel).unwrap();
+        let id = doc.frontmatter.get_str("id").unwrap();
+        let sidecar = std::fs::read_to_string(tmp.path().join("audio/take-001.yaml")).unwrap();
+        assert!(sidecar.contains("kind: chapter"), "{sidecar}");
+        assert!(sidecar.contains(&format!("id: {id}")), "{sidecar}");
+
+        // Enter plays the selected take through the host.
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert_eq!(host.played().len(), 1, "playback got the take's frames");
+
+        // Esc returns to the tree.
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.audio_panel.is_none());
+    }
+
+    /// A recording is never lost to a closed panel: Esc while recording
+    /// stops, saves, and closes.
+    #[test]
+    fn closing_the_panel_while_recording_still_saves_the_take() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.audio_panel.is_none());
+        assert!(
+            tmp.path().join("audio/take-001.wav").is_file(),
+            "the recording was saved before closing"
+        );
+        assert!(
+            app.status.contains("saved"),
+            "status reports the save: {}",
+            app.status
+        );
+    }
+
+    /// With a song's lyrics open, takes land in the song's `demos/` and
+    /// attach to the song's id.
+    #[test]
+    fn audio_panel_saves_song_demos_into_the_song_and_attaches_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let entry = oca_music::Music::new_song(&mut core, "test-song", "Test Song").unwrap();
+        let host = Arc::new(MockHost::with_chunks(
+            oca_audio::AudioSpec::mono(8_000),
+            vec![vec![0.3; 80]],
+        ));
+        let mut app = App::new(&core, host.clone());
+        app.open_doc(&mut core, entry.lyrics_rel.clone());
+
+        app.focus = Focus::Tree;
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        {
+            let panel = app.audio_panel.as_ref().unwrap();
+            assert!(matches!(panel.ctx, AttachContext::Song(_)));
+            assert_eq!(panel.dir_rel, PathBuf::from("music/songs/test-song/demos"));
+        }
+
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        let wav = tmp.path().join("music/songs/test-song/demos/take-001.wav");
+        assert!(wav.is_file(), "demo saved inside the song directory");
+
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        let song_yaml =
+            std::fs::read_to_string(tmp.path().join("music/songs/test-song/song.yaml")).unwrap();
+        let song_id: String = song_yaml
+            .lines()
+            .find_map(|l| l.strip_prefix("id:"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let sidecar =
+            std::fs::read_to_string(tmp.path().join("music/songs/test-song/demos/take-001.yaml"))
+                .unwrap();
+        assert!(sidecar.contains("kind: song"), "{sidecar}");
+        assert!(sidecar.contains(&format!("id: {song_id}")), "{sidecar}");
+        assert!(
+            app.status.contains("song"),
+            "status shows the target: {}",
+            app.status
+        );
+    }
+
+    /// The panel renders over the workspace with its take list.
+    #[test]
+    fn audio_panel_draws() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw(&core, frame))
+            .expect("frame renders");
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Audio"), "panel title renders");
+        assert!(text.contains("no takes yet"), "empty state renders");
     }
 }
