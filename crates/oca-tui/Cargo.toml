@@ -1,0 +1,28 @@
+[package]
+name = "oca-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA Ratatui frontend — thin client of the Core API (no business logic)"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+oca-core.workspace = true
+oca-model.workspace = true
+oca-music.workspace = true
+oca-story.workspace = true
+ratatui.workspace = true
+ropey.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

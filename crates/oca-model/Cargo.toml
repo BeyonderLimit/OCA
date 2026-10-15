@@ -1,0 +1,18 @@
+[package]
+name = "oca-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA shared domain types: ids, lossless YAML, documents"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[lints]
+workspace = true

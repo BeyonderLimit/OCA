@@ -1,0 +1,25 @@
+[package]
+name = "oca-music"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA music engine: song model, lyrics sections, deterministic syllable/rhyme tools, chord transposition"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+oca-core.workspace = true
+oca-markdown.workspace = true
+oca-model.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+oca-storage.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

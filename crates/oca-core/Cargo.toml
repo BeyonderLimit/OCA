@@ -1,0 +1,22 @@
+[package]
+name = "oca-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA Core API: commands + events, the single mutation choke point"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+oca-markdown.workspace = true
+oca-model.workspace = true
+oca-storage.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

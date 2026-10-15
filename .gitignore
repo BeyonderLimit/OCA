@@ -1,0 +1,18 @@
+/target
+/fixtures/
+*.log
+.DS_Store
+
+# Example projects: keep the empty .oca skeleton committed, not runtime
+# artifacts (lock, logs, future cache contents).
+examples/*/.oca/cache/*
+examples/*/.oca/state/*
+examples/*/.oca/state/recovery/*
+examples/*/.oca/logs/*
+!examples/*/.oca/cache/.gitkeep
+!examples/*/.oca/state/.gitkeep
+# Re-include the recovery dir itself first: git does not descend into an
+# excluded directory, so its .gitkeep negation below would never apply.
+!examples/*/.oca/state/recovery/
+!examples/*/.oca/state/recovery/.gitkeep
+!examples/*/.oca/logs/.gitkeep

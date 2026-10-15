@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.profile }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace ${{ matrix.profile == 'release' && '--release' || '' }}
+      - name: build binary
+        run: cargo build --workspace ${{ matrix.profile == 'release' && '--release' || '' }}
+      - name: smoke binary
+        shell: bash
+        run: |
+          dir="${{ matrix.profile == 'release' && 'release' || 'debug' }}"
+          bin="target/$dir/oca${{ runner.os == 'Windows' && '.exe' || '' }}"
+          "$bin" --version
+          "$bin" doctor
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oca-${{ matrix.os }}-${{ matrix.profile }}
+          path: target/${{ matrix.profile == 'release' && 'release' || 'debug' }}/oca*
+          if-no-files-found: error

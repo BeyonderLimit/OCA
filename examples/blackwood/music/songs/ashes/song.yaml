@@ -1,0 +1,20 @@
+type: song
+id: song_ashes
+language: en
+title: Ashes
+artist: ""
+status: draft
+genre: [alternative, cinematic]
+mood: [melancholic, defiant]
+tempo: 92
+key: D minor
+time_signature: 4/4
+themes: [loss, rebirth, memory]
+
+# Optional plan; lyrics.md headings are authoritative (oca song check
+# reports drift between this and the actual sections).
+plan: [intro, verse, pre_chorus, chorus, verse, final_chorus, chorus, outro]
+
+links:                          # ids, in-project
+  chapters: [ch_001, ch_005]
+  characters: [elena]

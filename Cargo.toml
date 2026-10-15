@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/oca-cli",
+    "crates/oca-core",
+    "crates/oca-markdown",
+    "crates/oca-model",
+    "crates/oca-storage",
+    "crates/oca-story",
+    "crates/oca-music",
+    "crates/oca-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# 1.89: std File::try_lock powers the single-writer lock (A3).
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+# Placeholder: swap for the real repo URL, then re-run `dist generate`.
+repository = "https://github.com/oca-offline/oca"
+
+[workspace.lints.clippy]
+# CI runs `cargo clippy -- -D warnings`, so every warning here fails the build.
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+comrak = "0.56"
+crossterm = "0.28"
+getrandom = "0.3"
+oca-core = { path = "crates/oca-core" }
+oca-markdown = { path = "crates/oca-markdown" }
+oca-model = { path = "crates/oca-model" }
+oca-storage = { path = "crates/oca-storage" }
+oca-story = { path = "crates/oca-story" }
+oca-music = { path = "crates/oca-music" }
+oca-tui = { path = "crates/oca-tui" }
+ratatui = "0.29"
+ropey = "1.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

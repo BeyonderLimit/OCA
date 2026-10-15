@@ -1,0 +1,25 @@
+[package]
+name = "oca-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA filesystem layout, atomic writes, lock, recovery journal, index"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+oca-markdown.workspace = true
+oca-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "oca-markdown"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA document model and comrak-based Markdown parsing"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+comrak.workspace = true
+oca-model.workspace = true
+
+[lints]
+workspace = true

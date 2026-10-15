@@ -1,0 +1,7 @@
+# Project pronunciation overrides (A9): invented names the engine cannot
+# know. Values are space-separated phonemes (ARPAbet-like); vowels carry a
+# stress digit (0 unstressed, 1 primary, 2 secondary). These entries let
+# the rhyme tools treat "Lyra" like the word it sounds like.
+Blackwood: B L AE1 K W UH2 D
+Lyra: L AY1 ER0
+Elenor: EH1 L AH0 N AO2 R

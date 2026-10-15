@@ -1,0 +1,38 @@
+[package]
+name = "oca-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA — Offline Creative Assistant: thin CLI entry point"
+publish = false
+
+[[bin]]
+name = "oca"
+path = "src/main.rs"
+
+[package.metadata.dist]
+# Opt `publish = false` binary into cargo-dist (release dry-run from Phase 0, A7).
+dist = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+oca-core.workspace = true
+oca-model.workspace = true
+oca-music.workspace = true
+oca-storage.workspace = true
+oca-story.workspace = true
+oca-tui.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
