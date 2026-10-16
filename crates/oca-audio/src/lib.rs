@@ -1,15 +1,18 @@
-//! `oca-audio` — recording, playback, and take management without AI.
+//! `oca-audio` — recording, playback, take management, and dictation
+//! (Phase 7B) without AI.
 //!
 //! Layering (implementation plan §2): this sits above the story and music
 //! engines, which it uses to resolve attach targets ("attach to chapter"
 //! validates the chapter exists and stores its immutable id). Device I/O
 //! is abstracted behind [`AudioHost`] so every rule here is testable
-//! without hardware ([`mock::MockHost`]).
+//! without hardware ([`mock::MockHost`]), and speech-to-text behind
+//! [`Transcriber`] so dictation is testable — and usable — without any
+//! model installed (rule 3).
 //!
 //! Files are canonical (rule 2): a take is `<stem>.wav` + `<stem>.yaml`
-//! sidecar under `audio/` or `music/songs/<song>/demos/`. Nothing is
-//! stored in the database yet — the index arrives in Phase 5.
+//! sidecar under `audio/` or `music/songs/<song>/demos/`.
 
+pub mod dictation;
 pub mod host;
 pub mod mock;
 pub mod play;
@@ -20,18 +23,20 @@ pub mod wav;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, bail};
 use oca_core::Core;
 use oca_music::Music;
 use oca_story::Story;
 
+pub use dictation::{FnTranscriber, Transcriber};
 pub use host::{AudioHost, CaptureStream, CpalHost, PlaybackStream};
 pub use mock::MockHost;
 pub use play::Player;
 pub use record::{RecState, RecordedAudio, Recorder};
 pub use store::TakeStore;
-pub use take::{Attachment, Note, Take, TakeMeta};
+pub use take::{Attachment, Note, Take, TakeMeta, Transcript};
 pub use wav::{AudioSpec, DecodedAudio};
 
 /// Audio subsystem over an open project: the facade TUI and CLI talk to.
@@ -39,6 +44,9 @@ pub struct Audio<'c> {
     core: &'c Core,
     host: Arc<dyn AudioHost>,
     store: TakeStore,
+    /// Dictation (Phase 7B): the injected whisper seam — `None` means no
+    /// transcription runtime, which only ever disables transcription.
+    transcriber: Option<Arc<dyn Transcriber>>,
 }
 
 /// What the devices look like right now (for `oca doctor`): the format
@@ -57,6 +65,17 @@ impl DeviceReport {
 
 impl<'c> Audio<'c> {
     pub fn new(core: &'c Core, host: Arc<dyn AudioHost>) -> Result<Self> {
+        Self::with_transcriber(core, host, None)
+    }
+
+    /// The facade with dictation wired up (Phase 7B). `None` = no runtime:
+    /// [`transcribe`](Self::transcribe) then explains itself instead of
+    /// guessing, and everything else behaves exactly as before.
+    pub fn with_transcriber(
+        core: &'c Core,
+        host: Arc<dyn AudioHost>,
+        transcriber: Option<Arc<dyn Transcriber>>,
+    ) -> Result<Self> {
         let root = core
             .project()
             .context("no project is open")?
@@ -66,7 +85,32 @@ impl<'c> Audio<'c> {
             core,
             host,
             store: TakeStore::new(root),
+            transcriber,
         })
+    }
+
+    /// The transcription runtime's description, for status lines.
+    pub fn transcriber_label(&self) -> Option<String> {
+        self.transcriber.as_ref().map(|t| t.label())
+    }
+
+    /// Take → raw transcript, stored with the take (`transcript:` in the
+    /// sidecar) and returned. **Nothing enters the manuscript here** — a
+    /// transcript never inserts itself; the author chooses afterwards via
+    /// [`dictation::add_to_notes`] / [`dictation::insert_into_chapter`] or
+    /// the TUI keys.
+    pub fn transcribe(&self, take: &Take) -> Result<String> {
+        self.writable("transcribe takes")?;
+        let transcriber = self
+            .transcriber
+            .as_ref()
+            .context(dictation::missing_runtime_hint())?;
+        dictation::transcribe_to_store(
+            &self.store,
+            take,
+            transcriber.as_ref(),
+            &AtomicBool::new(false),
+        )
     }
 
     pub fn store(&self) -> &TakeStore {

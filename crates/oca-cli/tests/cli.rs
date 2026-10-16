@@ -1076,3 +1076,224 @@ fn doctor_reports_ai_runtime_models_and_hardware() {
     assert!(stdout.contains("Hardware"), "got: {stdout}");
     assert!(stdout.contains("cores"), "got: {stdout}");
 }
+
+// ---- dictation (Phase 7B) --------------------------------------------------
+
+/// The transcription runtime for e2e: this very test binary, invoked as a
+/// single libtest case. Dictation sets `OCA_TRANSCRIBE_OUT` only on the
+/// child it spawns, so a regular test run of this case does nothing — the
+/// fake can never misfire into a normal run.
+#[test]
+fn fake_whisper_cli() {
+    let Ok(out) = std::env::var("OCA_TRANSCRIBE_OUT") else {
+        return;
+    };
+    std::fs::write(&out, "the lamp was lit in the hallway\n").unwrap();
+}
+
+/// Config that points `whisper-cli` at [`fake_whisper_cli`] above, plus a
+/// stand-in model file — together, the only "whisper installed" this
+/// machine gets: no LLM anywhere near it.
+fn dictation_config(home: &Path) -> String {
+    let me = std::env::current_exe().unwrap();
+    let models = home.join(".oca").join("models").join("whisper");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("ggml-tiny.gguf"), vec![0u8; 128]).unwrap();
+    format!(
+        "[ai]\nwhisper_cli = {:?}\nwhisper_args = [\"fake_whisper_cli\", \"--exact\", \"--quiet\"]\n",
+        me.display().to_string()
+    )
+}
+
+fn write_ai_config(home: &Path, body: &str) {
+    std::fs::create_dir_all(home.join(".oca")).unwrap();
+    std::fs::write(home.join(".oca").join("config.toml"), body).unwrap();
+}
+
+/// True when any chapter file under `manuscript/` contains the text.
+fn manuscript_contains(root: &Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root.join("manuscript")) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path().extension().is_some_and(|x| x == "md")
+            && std::fs::read_to_string(e.path()).is_ok_and(|body| body.contains(needle))
+    })
+}
+
+/// Phase 7B exit, CLI half: with **only** a whisper stand-in installed,
+/// `oca dictate` transcribes, stores the raw transcript with the take, and
+/// sends it further only where explicitly asked — never on its own.
+#[test]
+fn phase7b_exit_dictate_transcribes_and_sends_where_asked() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0001");
+    write_ai_config(&home, &dictation_config(&home));
+    const SAID: &str = "the lamp was lit in the hallway";
+
+    // -- raw dictation: transcript stored with the take, and *nowhere else*
+    let out = run_in(&home, tmp.path(), &root, &["dictate", "voice-memo"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "dictate must work with no LLM: {stderr}"
+    );
+    assert!(stdout.contains(SAID), "transcript on stdout: {stdout}");
+    assert!(stderr.contains("transcribing with"), "status: {stderr}");
+    let sidecar = std::fs::read_to_string(root.join("audio/voice-memo.yaml")).unwrap();
+    assert!(sidecar.contains("transcript:"), "{sidecar}");
+    assert!(sidecar.contains(SAID), "{sidecar}");
+    assert!(
+        !manuscript_contains(&root, SAID),
+        "a transcript never auto-inserts into the manuscript"
+    );
+    assert!(
+        !root.join("notes/dictation.md").exists(),
+        "and never creates notes by itself"
+    );
+
+    // -- explicit: --into chapter:<chapter> appends on the author's say-so
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["dictate", "voice-memo", "--into", "chapter:1"],
+    );
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(manuscript_contains(&root, SAID), "inserted on request");
+
+    // -- explicit: --into notes appends to the dictation note.
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["dictate", "voice-memo", "--into", "notes"],
+    );
+    assert!(
+        out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let note = std::fs::read_to_string(root.join("notes/dictation.md")).unwrap();
+    assert!(note.contains("## voice memo"), "{note}");
+    assert!(note.contains(SAID), "{note}");
+}
+
+/// Rule 3 from the CLI: no runtime → an actionable error, nothing stored,
+/// and `oca doctor` already said so (its row is covered separately).
+#[test]
+fn dictate_without_a_runtime_explains_itself() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0001");
+    // Configured explicitly (so the machine's PATH can't make this flaky).
+    write_ai_config(
+        &home,
+        &format!(
+            "[ai]\nwhisper_cli = {:?}\n",
+            home.join("no-such-whisper").display().to_string()
+        ),
+    );
+
+    let out = run_in(&home, tmp.path(), &root, &["dictate", "voice-memo"]);
+    assert!(!out.status.success(), "no runtime must not pretend success");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no dictation runtime"), "got: {stderr}");
+    assert!(stderr.contains("runtime install"), "actionable: {stderr}");
+    let sidecar = std::fs::read_to_string(root.join("audio/voice-memo.yaml")).unwrap();
+    assert!(
+        !sidecar.contains("transcript:"),
+        "nothing stored: {sidecar}"
+    );
+}
+
+/// The LLM half of dictation is optional *and* preview-only: `--clean`
+/// without a model fails with guidance, and combining it with `--into` is
+/// refused outright (the cleanup would be reviewed, never auto-sent).
+#[test]
+fn dictate_cleanups_need_a_llm_and_refuse_into() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    seed_take(&root, "voice-memo", "voice memo", "take_SEED0001");
+    write_ai_config(&home, &dictation_config(&home));
+
+    // --clean without any LLM installed: the transcript still prints, the
+    // command reports that the requested cleanup couldn't run, and no
+    // model is silently skipped.
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["dictate", "voice-memo", "--clean"],
+    );
+    assert!(!out.status.success(), "the requested cleanup cannot run");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the lamp was lit"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("needs a language model"), "got: {stderr}");
+
+    // --clean + --into: refused before anything runs (review first).
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["dictate", "voice-memo", "--clean", "--into", "notes"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("review the cleanup first"), "got: {stderr}");
+    assert!(!root.join("notes/dictation.md").exists(), "nothing written");
+
+    // --clean --prose together: pick one.
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["dictate", "voice-memo", "--clean", "--prose"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pick one"));
+}
+
+/// `doctor` discovers dictation (runtime + model, never spawns) and reports
+/// it independently of the LLM side: whisper present, language model absent.
+#[test]
+fn doctor_reports_dictation_independently_of_the_llm() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let cli = home.join("whisper-cli-stand-in");
+    std::fs::write(&cli, b"stand-in").unwrap();
+    let models = home.join(".oca").join("models").join("whisper");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("ggml-tiny.gguf"), vec![0u8; 128]).unwrap();
+    write_ai_config(
+        home,
+        &format!("[ai]\nwhisper_cli = {:?}\n", cli.display().to_string()),
+    );
+
+    let out = oca_in(home).arg("doctor").output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stderr.is_empty(),
+        "doctor keeps stderr silent: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("✓ Dictation"), "got: {stdout}");
+    assert!(stdout.contains("whisper-cli-stand-in"), "got: {stdout}");
+    assert!(stdout.contains("ggml-tiny"), "got: {stdout}");
+    assert!(stdout.contains("no language model"), "got: {stdout}");
+    // The LLM side is still missing — and that's a warning, not a failure.
+    assert!(stdout.contains("⚠ Models"), "got: {stdout}");
+}

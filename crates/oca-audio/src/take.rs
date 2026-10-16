@@ -64,6 +64,18 @@ impl Note {
     }
 }
 
+/// The raw transcript of a dictation take (Phase 7B): what the speaker
+/// said, kept verbatim with the audio. It never rewrites itself into the
+/// manuscript — where it goes is always an author's decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// Verbatim recognized speech (already trimmed of surrounding space).
+    pub text: String,
+    /// RFC 3339 UTC timestamp of the transcription run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+}
+
 /// The parsed sidecar document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TakeMeta {
@@ -82,6 +94,9 @@ pub struct TakeMeta {
     pub attached: Option<Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<Note>,
+    /// Set when the take has been transcribed (dictation, Phase 7B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Transcript>,
 }
 
 /// A take on disk: parsed metadata plus the two files' project-relative
@@ -156,6 +171,7 @@ mod tests {
             checksum: "sha256:00".into(),
             attached: Some(Attachment::Chapter { id: "ch_01".into() }),
             note: None,
+            transcript: None,
         }
     }
 
@@ -165,6 +181,30 @@ mod tests {
         let back: TakeMeta = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back, meta());
         assert!(yaml.contains("kind: chapter"));
+    }
+
+    #[test]
+    fn a_dictation_transcript_round_trips() {
+        let mut m = meta();
+        m.transcript = Some(Transcript {
+            text: "the lamp was lit\nand the door stood open".into(),
+            created: Some("2026-10-16T09:30:00Z".into()),
+        });
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert!(yaml.contains("transcript:"), "{yaml}");
+        let back: TakeMeta = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            back.transcript.as_ref().unwrap().text,
+            "the lamp was lit\nand the door stood open"
+        );
+
+        // Sidecars without the key (every take saved before Phase 7B)
+        // parse with no transcript at all.
+        let mut plain = meta();
+        plain.transcript = None;
+        let legacy = serde_yaml::to_string(&plain).unwrap();
+        let back: TakeMeta = serde_yaml::from_str(&legacy).unwrap();
+        assert!(back.transcript.is_none());
     }
 
     #[test]

@@ -42,7 +42,14 @@ impl Drop for TermGuard {
 
 /// Run the interactive editor on an already-open project. `ai` is the
 /// optional AI runtime facade (rule 3 — `None` keeps every feature working).
-pub fn run(core: &mut Core, ai: Option<oca_ai::Ai>) -> Result<()> {
+/// Run the TUI. `ai` and `transcriber` (dictation, Phase 7B) are both
+/// optional — `None` means not installed, and the panels explain what's
+/// missing instead of failing (rule 3).
+pub fn run(
+    core: &mut Core,
+    ai: Option<oca_ai::Ai>,
+    transcriber: Option<Arc<dyn oca_audio::Transcriber>>,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -57,6 +64,9 @@ pub fn run(core: &mut Core, ai: Option<oca_ai::Ai>) -> Result<()> {
     let mut app = App::new(core, Arc::new(CpalHost));
     if let Some(ai) = ai {
         app.attach_ai(ai);
+    }
+    if let Some(transcriber) = transcriber {
+        app.attach_transcriber(transcriber);
     }
     loop {
         terminal.draw(|frame| app.draw(core, frame))?;

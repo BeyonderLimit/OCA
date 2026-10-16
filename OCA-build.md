@@ -596,7 +596,9 @@ Notes: "Needs to feel bigger on the last line."
 
 Design the data model now so melody/MIDI fields can be added later without migration pain (v1 does **no** melody extraction).
 
-**What v1 ships (Phase 4):** the take pipeline in §4.7 — record, pause/resume, save, list, play back, attach to chapter/song/project, rename, delete — with takes stored by WAV + sidecar and attachment validated through the owning engines. `note.text`/`note.lyrics`/`note.tempo` are editable; `note.melody` is preserved losslessly but writable only by future AI operations. Dictation (whisper.cpp) and melody extraction are Phase 7B/17 and must not block the offline core.
+**What v1 ships (Phase 4):** the take pipeline in §4.7 — record, pause/resume, save, list, play back, attach to chapter/song/project, rename, delete — with takes stored by WAV + sidecar and attachment validated through the owning engines. `note.text`/`note.lyrics`/`note.tempo` are editable; `note.melody` is preserved losslessly but writable only by future AI operations.
+
+**What v1 ships (Phase 7B, dictation):** `oca dictate <take>` turns a take into a raw transcript through a side-loaded `whisper-cli` + `~/.oca/models/whisper` model — no LLM required — stored in the take's sidecar (`transcript:`) and searchable through the Phase 5 index. The five options above are all explicit author actions: keep raw is the default, `--into notes|chapter:<key>` / the TUI's `i`/`n` send it onward, and the two LLM cleanups are **previews only** (shown for review, never written; the CLI refuses `--clean` with `--into`). A transcript never auto-inserts into the manuscript. Melody extraction stays Phase 17.
 
 ---
 

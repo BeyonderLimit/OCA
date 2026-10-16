@@ -37,6 +37,22 @@ pub fn dispatch(cmd: Command, home: Option<&Path>, cfg: &Config) -> Result<u8> {
         Command::Migrate { project } => migrate(project.as_deref()),
         Command::Snapshot { cmd } => snapshot(cmd),
         Command::Runtime { cmd } => runtime(cmd, home),
+        Command::Dictate {
+            take,
+            into,
+            clean,
+            prose,
+            language,
+            project,
+        } => dictate(
+            &take,
+            into.as_deref(),
+            clean,
+            prose,
+            language.as_deref(),
+            project.as_deref(),
+            cfg,
+        ),
         Command::Doctor => unreachable!("doctor is dispatched from main"),
     }
 }
@@ -169,15 +185,145 @@ fn open_tui(project: Option<&str>, cfg: &Config) -> Result<u8> {
     let root = resolve_open_arg(project)?;
     let mut core = open_core(&root)?;
     // AI is optional end-to-end (rule 3): a failed discovery just means no
-    // AI panel data, never a failed launch.
-    let ai = match oca_ai::bootstrap(&cfg.bootstrap_options()) {
+    // AI panel data, never a failed launch. Dictation (Phase 7B) is
+    // discovered the same way — it never requires the LLM side.
+    let opts = cfg.bootstrap_options();
+    let ai = match oca_ai::bootstrap(&opts) {
         Ok(ai) => ai,
         Err(err) => {
             tracing::warn!("AI runtime discovery failed: {err:#}");
             None
         }
     };
-    oca_tui::run(&mut core, ai)?;
+    // One residency policy for the session (ADR-0006): the panel's model
+    // and dictation share the governor through this handle.
+    let governor = ai
+        .as_ref()
+        .map(|ai| ai.governor())
+        .unwrap_or_else(oca_ai::ModelManager::new);
+    let dictation = match oca_ai::bootstrap_dictation(&opts, governor) {
+        Ok(dictation) => dictation,
+        Err(err) => {
+            tracing::warn!("dictation discovery failed: {err:#}");
+            None
+        }
+    };
+    let transcriber = dictation.map(|dictation| {
+        let label = dictation.info().label();
+        Arc::new(oca_audio::FnTranscriber::new(
+            label,
+            move |wav: &Path, cancel: &std::sync::atomic::AtomicBool| {
+                dictation.transcribe(wav, cancel)
+            },
+        )) as Arc<dyn oca_audio::Transcriber>
+    });
+    oca_tui::run(&mut core, ai, transcriber)?;
+    Ok(0)
+}
+
+/// Dictation (Phase 7B): whisper transcription of a recorded take. The raw
+/// transcript is stored with the take first; `--into` is an explicit
+/// second step, and the LLM cleanups are previews — AI output is never
+/// written into project files (proposals arrive with Phase 8).
+fn dictate(
+    take_key: &str,
+    into: Option<&str>,
+    clean: bool,
+    prose: bool,
+    language: Option<&str>,
+    project: Option<&Path>,
+    cfg: &Config,
+) -> Result<u8> {
+    if clean && prose {
+        bail!("pick one of --clean or --prose, not both");
+    }
+    if (clean || prose) && into.is_some() {
+        bail!(
+            "--into cannot be combined with --clean/--prose — review the cleanup first, \
+             then send the text you actually want (AI output is only ever shown for review)"
+        );
+    }
+
+    let root = find_project(project)?;
+    let mut core = open_core(&root)?;
+
+    let mut opts = cfg.bootstrap_options();
+    if let Some(lang) = language {
+        opts.whisper_language = Some(lang.to_string());
+    }
+    // One residency policy for the whole run (ADR-0006): transcription
+    // takes the whisper slot, a cleanup run takes the LLM slot — never
+    // both heavy models resident at once.
+    let governor = oca_ai::ModelManager::new();
+    let dictation = oca_ai::bootstrap_dictation(&opts, governor)
+        .context("dictation runtime discovery failed")?
+        .ok_or_else(|| anyhow::anyhow!("{}", oca_audio::dictation::missing_runtime_hint()))?;
+
+    let label = dictation.info().label();
+    let transcriber = Arc::new(oca_audio::FnTranscriber::new(
+        label.clone(),
+        move |wav: &Path, cancel: &std::sync::atomic::AtomicBool| dictation.transcribe(wav, cancel),
+    )) as Arc<dyn oca_audio::Transcriber>;
+    let host: Arc<dyn oca_audio::AudioHost> = Arc::new(oca_audio::CpalHost);
+    let facade = oca_audio::Audio::with_transcriber(&core, host, Some(transcriber))?;
+    let take = facade.take(take_key)?;
+
+    eprintln!("transcribing with {label}…");
+    let text = facade.transcribe(&take)?;
+    println!("{text}");
+
+    if clean || prose {
+        let mode = if clean {
+            oca_ai::Cleanup::Clean
+        } else {
+            oca_ai::Cleanup::Prose
+        };
+        let ai = oca_ai::bootstrap(&opts)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "cleanup needs a language model — none is installed \
+                 (dictation itself works without one)"
+            )
+        })?;
+        ai.load()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outcome = ai.stream(oca_ai::cleanup_request(mode, &text), tx);
+        let preview: String = rx.iter().collect();
+        let _ = ai.unload();
+        outcome?;
+        eprintln!();
+        println!("{preview}");
+        eprintln!(
+            "preview only — review it, then insert the text you want \
+             (`oca dictate --into …` sends the raw transcript; AI output \
+             never writes to files itself)"
+        );
+        return Ok(0);
+    }
+
+    match into {
+        None => {
+            eprintln!("stored with the take {}", take.meta.take_id);
+        }
+        Some("notes") => {
+            let path = oca_audio::dictation::add_to_notes(&mut core, &take, &text)?;
+            eprintln!(
+                "stored with the take {} + added to {}",
+                take.meta.take_id,
+                path.display()
+            );
+        }
+        Some(target) => {
+            let Some(chapter) = target.strip_prefix("chapter:") else {
+                bail!("unknown --into target {target:?} — use `notes` or `chapter:<chapter>`");
+            };
+            let rel = oca_audio::dictation::insert_into_chapter(&mut core, chapter, &text)?;
+            eprintln!(
+                "stored with the take {} + inserted into {}",
+                take.meta.take_id,
+                rel.display()
+            );
+        }
+    }
     Ok(0)
 }
 

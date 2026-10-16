@@ -7,6 +7,9 @@
 //!   per-session API key (ADR-0007), streams tokens over its OpenAI-compatible
 //!   HTTP API, and treats cancel as socket-abort + process kill. A crashed
 //!   runtime is a clean error, never a crash of OCA.
+//! - [`Dictation`] (Phase 7B) runs whisper.cpp as a one-shot transcription
+//!   subprocess — dictation works with **no LLM installed**, but shares the
+//!   same residency slot while it runs.
 //! - [`ModelManager`] enforces the one-heavy-model governor (ADR-0006):
 //!   LLM / embeddings / whisper share the machine's appetite; swaps are
 //!   explicit.
@@ -25,6 +28,7 @@ mod hardware;
 mod mock;
 mod packs;
 mod subprocess;
+mod whisper;
 
 pub use hardware::{Hardware, Tier};
 pub use mock::MockModel;
@@ -36,6 +40,10 @@ pub use packs::{
 pub use subprocess::LlamaCppSubprocess;
 #[doc(hidden)]
 pub use subprocess::fake_server;
+pub use whisper::{
+    Dictation, DictationInfo, WhisperConfig, default_whisper_models_dir, discover_whisper_models,
+    find_whisper_cli, find_whisper_cli_in,
+};
 
 /// How the runtime describes itself to the UI (`doctor`, the AI panel).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,9 +176,15 @@ impl HeavyModel {
 
 /// The one-heavy-model governor (ADR-0006): by default only one heavy model
 /// is resident; swapping kinds is explicit — the user unloads one and loads
-/// another, never silently.
-#[derive(Debug)]
+/// another, never silently. Cheap to clone: clones share the same slot, so
+/// the language model and dictation run under one policy.
+#[derive(Clone, Debug)]
 pub struct ModelManager {
+    inner: Arc<ManagerInner>,
+}
+
+#[derive(Debug)]
+struct ManagerInner {
     resident: Mutex<Option<HeavyModel>>,
     capacity: usize,
 }
@@ -185,28 +199,36 @@ impl ModelManager {
     /// Governor default: one heavy model resident at a time.
     pub fn new() -> Self {
         Self {
-            resident: Mutex::new(None),
-            capacity: 1,
+            inner: Arc::new(ManagerInner {
+                resident: Mutex::new(None),
+                capacity: 1,
+            }),
         }
     }
 
-    /// Spare-RAM machines may raise this via config (still explicit).
+    /// Spare-RAM machines may raise this via config (still explicit). A
+    /// clone with its own budget only pays off when it stays private —
+    /// sharing one budget across clones is the point of `Arc`, so this
+    /// rebuilds the slot instead of aliasing someone else's.
     pub fn with_capacity(mut self, capacity: usize) -> Self {
-        self.capacity = capacity.max(1);
+        self.inner = Arc::new(ManagerInner {
+            resident: Mutex::new(None),
+            capacity: capacity.max(1),
+        });
         self
     }
 
     /// Reserve the residency slot for `kind`. Errors when another kind is
     /// resident and the budget is full — the caller unloads first.
     pub fn claim(&self, kind: HeavyModel) -> Result<()> {
-        let mut resident = self.resident.lock().expect("manager lock");
+        let mut resident = self.inner.resident.lock().expect("manager lock");
         match *resident {
             None => {
                 *resident = Some(kind);
                 Ok(())
             }
             Some(current) if current == kind => Ok(()),
-            Some(current) if self.capacity > 1 => {
+            Some(current) if self.inner.capacity > 1 => {
                 // Spare capacity: allow the second kind alongside.
                 *resident = Some(kind);
                 tracing::info!(kind = ?kind, resident = ?current, "additional heavy model resident");
@@ -221,20 +243,20 @@ impl ModelManager {
 
     /// Free the slot (only if it is ours).
     pub fn release(&self, kind: HeavyModel) {
-        let mut resident = self.resident.lock().expect("manager lock");
+        let mut resident = self.inner.resident.lock().expect("manager lock");
         if *resident == Some(kind) {
             *resident = None;
         }
     }
 
     pub fn resident(&self) -> Option<HeavyModel> {
-        *self.resident.lock().expect("manager lock")
+        *self.inner.resident.lock().expect("manager lock")
     }
 
     /// Human-readable policy for `doctor` and config dumps.
     pub fn policy(&self) -> String {
-        if self.capacity > 1 {
-            format!("up to {} heavy models resident", self.capacity)
+        if self.inner.capacity > 1 {
+            format!("up to {} heavy models resident", self.inner.capacity)
         } else {
             "one heavy model at a time".to_string()
         }
@@ -253,6 +275,12 @@ pub struct DiscoveredModel {
 /// Scan `dir` for `*.gguf`, largest first (the usual "best model here"
 /// heuristic). A missing directory is not an error — it just means "none".
 pub fn discover_models(dir: &Path) -> Result<Vec<DiscoveredModel>> {
+    discover_model_files(dir, &["gguf"])
+}
+
+/// The extension-parametric scan behind [`discover_models`] and
+/// [`discover_whisper_models`] (which also accepts legacy `.bin` models).
+pub(crate) fn discover_model_files(dir: &Path, exts: &[&str]) -> Result<Vec<DiscoveredModel>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -262,10 +290,10 @@ pub fn discover_models(dir: &Path) -> Result<Vec<DiscoveredModel>> {
     {
         let entry = entry?;
         let path = entry.path();
-        let is_gguf = path
+        let is_model = path
             .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
-        if !is_gguf || !path.is_file() {
+            .is_some_and(|e| exts.iter().any(|ext| e.eq_ignore_ascii_case(ext)));
+        if !is_model || !path.is_file() {
             continue;
         }
         let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -310,23 +338,33 @@ pub fn find_llama_server(runtime_dir: &Path) -> Option<PathBuf> {
 /// The search with an explicit `PATH` (`None` = search no `PATH` at all) —
 /// tests pass their own so nothing touches process-global state.
 pub fn find_server_in(runtime_dir: &Path, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    find_executable_in(runtime_dir, path_var, "llama-server")
+}
+
+/// One executable-name search, shared by `llama-server` and `whisper-cli`:
+/// installed runtime packs (`<pack>/bin/<exe>`) win over `PATH`.
+pub(crate) fn find_executable_in(
+    runtime_dir: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+    exe: &str,
+) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
-        "llama-server.exe"
+        format!("{exe}.exe")
     } else {
-        "llama-server"
+        exe.to_string()
     };
     if let Ok(packs) = std::fs::read_dir(runtime_dir) {
         let mut dirs: Vec<PathBuf> = packs.flatten().map(|e| e.path()).collect();
         dirs.sort();
         for dir in dirs {
-            let candidate = dir.join("bin").join(exe);
+            let candidate = dir.join("bin").join(&exe);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     for dir in std::env::split_paths(path_var?) {
-        let candidate = dir.join(exe);
+        let candidate = dir.join(&exe);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -344,6 +382,15 @@ pub struct BootstrapOptions {
     pub context: Option<u32>,
     pub gpu_layers: Option<u32>,
     pub threads: Option<u32>,
+    /// Dictation (Phase 7B): explicit `whisper-cli` path — beats discovery.
+    pub whisper_cli: Option<PathBuf>,
+    /// Whisper models directory (default `~/.oca/models/whisper`).
+    pub whisper_models_dir: Option<PathBuf>,
+    /// Spoken language for transcription (`None` = runtime auto-detect).
+    pub whisper_language: Option<String>,
+    /// Replace the standard whisper arguments entirely — test doubles and
+    /// nonstandard runtimes, mirroring [`ModelConfig::server_args`].
+    pub whisper_args: Option<Vec<String>>,
 }
 
 /// Build the AI facade if a runtime *and* a model are present; `None` means
@@ -380,6 +427,39 @@ pub fn bootstrap(opts: &BootstrapOptions) -> Result<Option<Ai>> {
     Ok(Some(Ai::new(Arc::new(model), models)))
 }
 
+/// Build the dictation runtime if a `whisper-cli` *and* a whisper model are
+/// present; `None` means "no dictation available" — and like every AI
+/// feature, dictation is optional (rule 3). It works with no LLM installed;
+/// `governor` is the shared residency policy so the two never fight for RAM.
+pub fn bootstrap_dictation(
+    opts: &BootstrapOptions,
+    governor: ModelManager,
+) -> Result<Option<Dictation>> {
+    let runtime_dir = opts.runtime_dir.clone().unwrap_or_else(default_runtime_dir);
+    let cli = match &opts.whisper_cli {
+        Some(explicit) if explicit.is_file() => Some(explicit.clone()),
+        Some(explicit) => {
+            tracing::warn!(path = %explicit.display(), "configured whisper-cli not found");
+            None
+        }
+        None => find_whisper_cli(&runtime_dir),
+    };
+    let Some(cli_bin) = cli else {
+        return Ok(None);
+    };
+    let models_dir = opts
+        .whisper_models_dir
+        .clone()
+        .unwrap_or_else(default_whisper_models_dir);
+    let Some(chosen) = discover_whisper_models(&models_dir)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let mut config = WhisperConfig::new(chosen.path, cli_bin);
+    config.language = opts.whisper_language.clone();
+    config.cli_args = opts.whisper_args.clone();
+    Ok(Some(Dictation::new(config, governor)))
+}
+
 /// A fixed prompt the AI panel uses to prove the pipeline works end-to-end
 /// (Phase 7 has no AI features yet — the context engine arrives in Phase 8).
 pub fn probe_request() -> GenerationRequest {
@@ -388,6 +468,44 @@ pub fn probe_request() -> GenerationRequest {
         system: Some("You are a concise writing companion.".into()),
         schema: None,
         max_tokens: Some(64),
+    }
+}
+
+/// The two LLM-assisted dictation cleanups (Phase 7B). Both are **preview
+/// only**: the output is shown for review and never written to a project
+/// file by the AI itself — the author decides where reviewed text goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cleanup {
+    /// Remove filler words and false starts; keep the speaker's wording.
+    Clean,
+    /// Turn the spoken draft into polished prose, inventing nothing.
+    Prose,
+}
+
+/// The generation request behind `oca dictate --clean` / `--prose` and the
+/// audio panel's `c`/`p` preview keys. The transcript is delimited as
+/// untrusted input (ADR-0008's provenance rule, applied early).
+pub fn cleanup_request(mode: Cleanup, transcript: &str) -> GenerationRequest {
+    let (system, instruction) = match mode {
+        Cleanup::Clean => (
+            "You clean up spoken drafts faithfully. Remove filler words and false \
+             starts, fix obvious punctuation, and add paragraph breaks only at \
+             natural pauses. Keep the speaker's wording and meaning. Output only \
+             the cleaned text.",
+            "Clean up this dictation transcript:",
+        ),
+        Cleanup::Prose => (
+            "You turn spoken notes into polished prose. Preserve every idea and \
+             image; improve flow, grammar, and paragraphing; invent nothing. \
+             Output only the prose.",
+            "Turn this dictation transcript into prose:",
+        ),
+    };
+    GenerationRequest {
+        prompt: format!("{instruction}\n<transcript>\n{transcript}\n</transcript>"),
+        system: Some(system.to_string()),
+        schema: None,
+        max_tokens: None,
     }
 }
 
@@ -468,6 +586,13 @@ impl Ai {
     pub fn policy(&self) -> String {
         self.inner.manager.policy()
     }
+
+    /// The shared governor itself — hand it to [`bootstrap_dictation`] so
+    /// the language model and whisper live under one residency budget
+    /// (ADR-0006).
+    pub fn governor(&self) -> ModelManager {
+        self.inner.manager.clone()
+    }
 }
 
 /// One-line size formatting for `doctor`/the panel ("1.4 GB", "812 MB").
@@ -516,6 +641,18 @@ mod tests {
         m.claim(HeavyModel::Llm).unwrap();
         m.claim(HeavyModel::Embeddings).unwrap();
         assert!(m.policy().contains('2'));
+    }
+
+    #[test]
+    fn cloned_managers_share_one_slot() {
+        // Ai::governor() hands clones to dictation — one policy, not two.
+        let m = ModelManager::new();
+        let clone = m.clone();
+        m.claim(HeavyModel::Llm).unwrap();
+        let err = clone.claim(HeavyModel::Whisper).unwrap_err().to_string();
+        assert!(err.contains("unload it first"), "{err}");
+        clone.release(HeavyModel::Llm);
+        assert_eq!(m.resident(), None, "releases are visible across clones");
     }
 
     #[test]
@@ -576,6 +713,74 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn whisper_discovery_finds_models_and_the_cli() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No dir → no models.
+        assert!(
+            discover_whisper_models(&tmp.path().join("nope"))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(tmp.path().join("tiny.bin"), vec![0u8; 10]).unwrap();
+        std::fs::write(tmp.path().join("base.gguf"), vec![0u8; 20]).unwrap();
+        std::fs::write(tmp.path().join("readme.md"), b"not a model").unwrap();
+        let found = discover_whisper_models(tmp.path()).unwrap();
+        assert_eq!(
+            found.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["base", "tiny"],
+            "gguf and legacy .bin both count, largest first"
+        );
+
+        // The CLI search: packs win over PATH, .exe suffix handled per OS.
+        let runtime = tmp.path().join("runtime");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = if cfg!(windows) {
+            "whisper-cli.exe"
+        } else {
+            "whisper-cli"
+        };
+        std::fs::write(bin.join(exe), b"#!/bin/sh\n").unwrap();
+        let path_var = std::ffi::OsString::from(bin.as_os_str());
+        assert_eq!(
+            find_whisper_cli_in(&runtime, Some(&path_var)),
+            Some(bin.join(exe))
+        );
+        assert_eq!(find_whisper_cli_in(&runtime, None), None);
+        let pack = runtime.join("whisper-pack-1").join("bin");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join(exe), b"packed\n").unwrap();
+        assert_eq!(
+            find_whisper_cli_in(&runtime, Some(&path_var)),
+            Some(pack.join(exe))
+        );
+    }
+
+    #[test]
+    fn cleanup_requests_delimit_the_transcript() {
+        for mode in [Cleanup::Clean, Cleanup::Prose] {
+            let req = cleanup_request(mode, "um, the door, it was open I think");
+            let prompt = &req.prompt;
+            assert!(prompt.contains("<transcript>\n"), "{prompt}");
+            assert!(prompt.ends_with("\n</transcript>"), "{prompt}");
+            assert!(
+                prompt.contains("the door, it was open"),
+                "the transcript travels verbatim: {prompt}"
+            );
+            let system = req.system.expect("system prompt");
+            assert!(!system.is_empty());
+            assert!(
+                !prompt.contains("Output only"),
+                "instructions stay in the system prompt"
+            );
+        }
+        assert_ne!(
+            cleanup_request(Cleanup::Clean, "x").system,
+            cleanup_request(Cleanup::Prose, "x").system
+        );
     }
 
     #[test]

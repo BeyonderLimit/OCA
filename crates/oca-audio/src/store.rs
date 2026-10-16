@@ -175,6 +175,7 @@ impl TakeStore {
             checksum: format!("sha256:{checksum}"),
             attached: None,
             note: None,
+            transcript: None,
         };
         let sidecar_bytes = serde_yaml::to_string(&meta).context("cannot render take metadata")?;
 
@@ -261,6 +262,19 @@ impl TakeStore {
             }
             _ => self.patch(take, "note", None),
         }
+    }
+
+    /// Store the raw dictation transcript with the take (`transcript:` in
+    /// the sidecar, losslessly patched like every other key). Writing it
+    /// here is the *only* automatic place a transcript lands — chapters
+    /// and notes are explicit author actions (Phase 7B).
+    pub fn set_transcript(&self, take: &Take, text: &str) -> Result<Take> {
+        let transcript = crate::take::Transcript {
+            text: text.to_string(),
+            created: Some(now_rfc3339()),
+        };
+        let block = serde_yaml::to_string(&transcript).context("cannot render transcript")?;
+        self.patch(take, "transcript", Some(&block))
     }
 
     pub fn load(&self, take: &Take) -> Result<DecodedAudio> {

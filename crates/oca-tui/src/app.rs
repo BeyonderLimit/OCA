@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use oca_ai::Ai;
-use oca_audio::{Audio, AudioHost, Player, RecState, Recorder, Take, default_take_dir};
+use oca_audio::{
+    Audio, AudioHost, Player, RecState, Recorder, Take, Transcriber, default_take_dir,
+};
 use oca_core::{Command, Core, Event, JobState, Priority, RecoveryEntry};
 use oca_model::DocumentKind;
 use oca_music::{CursorMetrics, EnglishPhonetics, Music, cursor_metrics, section_marks};
@@ -115,6 +117,34 @@ struct AudioPanel {
     sel: usize,
     rec: Option<Recorder>,
     player: Option<Player>,
+    /// The active transcript: freshly transcribed, or the stored one for
+    /// the selected take. Never auto-inserted anywhere — `i`/`n` are the
+    /// author's explicit say-so.
+    transcript: Option<String>,
+    /// Streaming preview of an LLM cleanup of the transcript. Shown for
+    /// review only; applying it is the author pressing `i`/`n`.
+    preview: Option<String>,
+    /// The dictation job (transcription or cleanup preview) while running.
+    dict_job: Option<(u64, DictJobKind)>,
+    /// Results streamed back by the running dictation job.
+    dict_rx: Option<std::sync::mpsc::Receiver<String>>,
+}
+
+/// What the running dictation job is doing — both stream into `dict_rx`,
+/// but a transcription lands as one message and a cleanup as tokens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictJobKind {
+    Transcribe,
+    Cleanup(&'static str),
+}
+
+impl DictJobKind {
+    fn label(self) -> &'static str {
+        match self {
+            DictJobKind::Transcribe => "transcription",
+            DictJobKind::Cleanup(label) => label,
+        }
+    }
 }
 
 enum Banner {
@@ -215,6 +245,10 @@ pub struct App {
     ai: Option<Ai>,
     /// Present while the AI panel is open.
     ai_panel: Option<AiPanel>,
+    /// Dictation (Phase 7B): the injected whisper seam — `None` means no
+    /// transcription runtime, which only ever disables `t`/`c`/`p` with an
+    /// explanation (rule 3: never required).
+    transcriber: Option<Arc<dyn Transcriber>>,
     /// Last pass that reconciled the cache index with external edits.
     last_reconcile: Instant,
     last_journal: Instant,
@@ -254,6 +288,7 @@ impl App {
             snap_panel: None,
             ai: None,
             ai_panel: None,
+            transcriber: None,
             last_reconcile: Instant::now(),
             last_journal: Instant::now(),
             quit: false,
@@ -543,6 +578,13 @@ impl App {
         self.ai = Some(ai);
     }
 
+    /// Attach the dictation runtime built by the frontend (Phase 7B).
+    /// Without it, the audio panel still opens and `t` explains what's
+    /// missing — dictation is optional like everything AI-adjacent (rule 3).
+    pub fn attach_transcriber(&mut self, transcriber: Arc<dyn Transcriber>) {
+        self.transcriber = Some(transcriber);
+    }
+
     // ---- AI panel (Phase 7) ----------------------------------------------
 
     fn open_ai_panel(&mut self) {
@@ -691,6 +733,7 @@ impl App {
     pub fn tick(&mut self, core: &mut Core) -> Result<()> {
         self.journal_now(core, false);
         self.poll_ai(core);
+        self.poll_dictation(core);
         // Reconcile the cache index with edits made outside this session
         // (the polling watcher — mtime walk, only changed files reparse).
         // Skip while read-only: the session holding the lock maintains it.
@@ -744,6 +787,10 @@ impl App {
             sel: 0,
             rec: None,
             player: None,
+            transcript: None,
+            preview: None,
+            dict_job: None,
+            dict_rx: None,
         };
         let host = Arc::clone(&self.audio_host);
         if let Ok(audio) = Audio::new(core, host) {
@@ -757,21 +804,135 @@ impl App {
                 }
             }
         }
-        self.status = format!(
-            "audio — new takes go to {} · attach to {}",
-            panel.dir_rel.display(),
-            panel.ctx.describe()
-        );
+        // A stored transcript shows up right away (files are canonical —
+        // reopening the panel never loses one).
+        panel.transcript = panel
+            .takes
+            .first()
+            .and_then(|t| t.meta.transcript.as_ref())
+            .map(|t| t.text.clone());
+        self.status = if self.transcriber.is_some() {
+            format!(
+                "audio — new takes go to {} · t transcribes the selected take",
+                panel.dir_rel.display()
+            )
+        } else {
+            format!(
+                "audio — new takes go to {} · dictation: no runtime installed",
+                panel.dir_rel.display()
+            )
+        };
         self.audio_panel = Some(panel);
         self.focus = Focus::Audio;
     }
 
-    fn audio_key(&mut self, core: &Core, key: KeyEvent) {
+    /// Cancel a running dictation job (Esc, or before the selection moves
+    /// under it) and drop whatever it hasn't delivered yet. A cleanup
+    /// stream also aborts at the model, exactly like the AI panel's stop.
+    fn stop_dict_job(&mut self, core: &mut Core, panel: &mut AudioPanel) -> bool {
+        let Some((job, kind)) = panel.dict_job.take() else {
+            return false;
+        };
+        core.cancel_job(job);
+        if matches!(kind, DictJobKind::Cleanup(_))
+            && let Some(ai) = &self.ai
+        {
+            ai.cancel();
+        }
+        panel.dict_rx = None;
+        true
+    }
+
+    /// Drain dictation results and retire the finished job (every tick),
+    /// mirroring [`poll_ai`](Self::poll_ai). A message can only be read
+    /// after taking the receiver out of the panel it borrows from.
+    fn poll_dictation(&mut self, core: &mut Core) {
+        let mut status: Option<String> = None;
+        let mut refresh = false;
+        let outcome: Option<(JobState, DictJobKind)> = {
+            let Some(panel) = &mut self.audio_panel else {
+                return;
+            };
+            let Some((id, kind)) = panel.dict_job else {
+                return;
+            };
+            let Some(snapshot) = core.job(id) else {
+                panel.dict_job = None;
+                panel.dict_rx = None;
+                return;
+            };
+            let msgs: Vec<String> = panel
+                .dict_rx
+                .as_ref()
+                .map(|rx| rx.try_iter().collect())
+                .unwrap_or_default();
+            for msg in msgs {
+                match kind {
+                    DictJobKind::Transcribe => panel.transcript = Some(msg),
+                    DictJobKind::Cleanup(_) => {
+                        panel.preview.get_or_insert_with(String::new).push_str(&msg)
+                    }
+                }
+            }
+            if snapshot.state.is_running() {
+                return;
+            }
+            // Everything the job sent arrived before it flipped to Done
+            // (same thread, send-then-return), so nothing is left behind.
+            panel.dict_job = None;
+            panel.dict_rx = None;
+            Some((snapshot.state, kind))
+        };
+        match outcome {
+            Some((JobState::Done, DictJobKind::Transcribe)) => refresh = true,
+            Some((JobState::Done, DictJobKind::Cleanup(label))) => {
+                status = Some(format!("{label} ready — i insert · n to notes · Esc close"));
+            }
+            Some((JobState::Failed(msg), kind)) => {
+                status = Some(format!("{} failed: {msg}", kind.label()));
+            }
+            Some((JobState::Cancelled, _)) => status = Some("stopped".into()),
+            _ => {}
+        }
+        if refresh {
+            // Re-read the store so the take list and the shown transcript
+            // match the sidecar that was just written.
+            if let Some(panel) = &mut self.audio_panel
+                && let Ok(audio) = Audio::new(core, Arc::clone(&self.audio_host))
+                && let Ok(takes) = audio.takes()
+            {
+                panel.takes = takes;
+                panel.sel = panel.sel.min(panel.takes.len().saturating_sub(1));
+                if let Some(take) = panel.takes.get(panel.sel) {
+                    panel.transcript = take.meta.transcript.as_ref().map(|t| t.text.clone());
+                }
+            }
+            status = status.or(Some(
+                "transcript ready — i insert · n to notes · c clean".into(),
+            ));
+        }
+        if let Some(s) = status {
+            self.status = s;
+        }
+    }
+
+    /// The text `i` (insert) and `n` (notes) act on: a preview being
+    /// reviewed first, else the raw transcript.
+    fn active_dict_text(panel: &AudioPanel) -> Option<String> {
+        panel
+            .preview
+            .as_ref()
+            .or(panel.transcript.as_ref())
+            .map(|t| t.to_string())
+    }
+
+    fn audio_key(&mut self, core: &mut Core, key: KeyEvent) {
         let Some(mut panel) = self.audio_panel.take() else {
             return;
         };
         let host = Arc::clone(&self.audio_host);
-        let audio = match Audio::new(core, host) {
+        let transcriber = self.transcriber.clone();
+        let audio = match Audio::with_transcriber(core, host, transcriber) {
             Ok(audio) => audio,
             Err(e) => {
                 self.status = format!("audio: {e}");
@@ -781,6 +942,13 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
+                if self.stop_dict_job(core, &mut panel) {
+                    // First Esc stops the run; the panel stays open with
+                    // whatever text was already reviewed.
+                    self.audio_panel = Some(panel);
+                    self.status = "stopped — Esc again closes".into();
+                    return;
+                }
                 if panel.rec.is_some() {
                     // Never lose a recording to a closed panel: save it,
                     // then drop the panel (it was taken out above).
@@ -793,6 +961,177 @@ impl App {
                 self.focus = Focus::Tree;
                 self.status = "audio closed".into();
                 return;
+            }
+            // Transcribe the selected take. The result is stored with the
+            // take's sidecar and *shown* here — it never touches the open
+            // document until the author presses `i`.
+            KeyCode::Char('t') if panel.rec.is_none() && panel.dict_job.is_none() => {
+                let take = panel.takes.get(panel.sel).cloned();
+                let (take, transcriber) = match (take, self.transcriber.clone()) {
+                    (Some(take), Some(transcriber)) => (take, transcriber),
+                    (_, _) => {
+                        self.audio_panel = Some(panel);
+                        self.status = oca_audio::dictation::missing_runtime_hint();
+                        return;
+                    }
+                };
+                let label = transcriber.label();
+                let Some(root) = core.project().map(|p| p.root().to_path_buf()) else {
+                    self.audio_panel = Some(panel);
+                    self.status = "no project is open".into();
+                    return;
+                };
+                let store = oca_audio::TakeStore::new(root);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let job = core.spawn_job(
+                    format!("transcribe {}", take.stem()),
+                    Priority::Interactive,
+                    move |ctx| {
+                        let token = ctx.cancel_token();
+                        match oca_audio::dictation::transcribe_to_store(
+                            &store,
+                            &take,
+                            transcriber.as_ref(),
+                            &token,
+                        ) {
+                            Ok(text) => {
+                                let _ = tx.send(text);
+                                Ok(())
+                            }
+                            // Author cancelled: stop quietly, don't report
+                            // a failure for an action they aborted.
+                            Err(_) if ctx.is_cancelled() => Ok(()),
+                            Err(err) => Err(err),
+                        }
+                    },
+                );
+                panel.transcript = None;
+                panel.preview = None;
+                panel.dict_job = Some((job, DictJobKind::Transcribe));
+                panel.dict_rx = Some(rx);
+                self.audio_panel = Some(panel);
+                self.status = format!("transcribing with {label} — Esc stops");
+                return;
+            }
+            // LLM cleanup of the active transcript — a *preview* streamed
+            // into the panel; it is never written anywhere by itself.
+            KeyCode::Char('c' | 'p')
+                if panel.rec.is_none()
+                    && panel.dict_job.is_none()
+                    && panel.transcript.is_some() =>
+            {
+                let kind = if key.code == KeyCode::Char('c') {
+                    DictJobKind::Cleanup("cleanup preview")
+                } else {
+                    DictJobKind::Cleanup("prose preview")
+                };
+                let mode = if key.code == KeyCode::Char('c') {
+                    oca_ai::Cleanup::Clean
+                } else {
+                    oca_ai::Cleanup::Prose
+                };
+                let Some(ai) = self.ai.clone() else {
+                    self.audio_panel = Some(panel);
+                    self.status =
+                        "cleanup needs a language model — optional; dictation works without one"
+                            .into();
+                    return;
+                };
+                let text = panel.transcript.clone().unwrap_or_default();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let request = oca_ai::cleanup_request(mode, &text);
+                let label = kind.label().to_string();
+                let job = core.spawn_job(label.clone(), Priority::Interactive, move |_ctx| {
+                    // Load on first use so the preview needs no trip
+                    // through the AI panel (and stays loaded after).
+                    if !ai.is_loaded() {
+                        ai.load()?;
+                    }
+                    ai.stream(request, tx).map(|_| ())
+                });
+                panel.preview = Some(String::new());
+                panel.dict_job = Some((job, kind));
+                panel.dict_rx = Some(rx);
+                self.audio_panel = Some(panel);
+                self.status = format!("{label} running — Esc stops");
+                return;
+            }
+            // Insert the reviewed text into the open document's *editor
+            // buffer* — the author saves with Ctrl-S; nothing touches files
+            // behind their eyes (transcripts never insert themselves).
+            KeyCode::Char('i') if panel.rec.is_none() => {
+                let text = Self::active_dict_text(&panel);
+                let is_manuscript = self
+                    .open_rel
+                    .as_deref()
+                    .is_some_and(|rel| group_of(rel) == "manuscript");
+                match (text, is_manuscript) {
+                    (Some(text), true) => {
+                        // Paragraph-shaped insert: only the gaps that aren't
+                        // there yet, on either side of the cursor.
+                        let full = self.editor.text();
+                        let at = self.editor.cursor().min(full.len());
+                        let before: String = full.chars().take(at).collect();
+                        let after: String = full.chars().skip(at).collect();
+                        let prefix = if before.is_empty() || before.ends_with("\n\n") {
+                            ""
+                        } else if before.ends_with('\n') {
+                            "\n"
+                        } else {
+                            "\n\n"
+                        };
+                        let suffix = if after.is_empty() || after.starts_with('\n') {
+                            ""
+                        } else {
+                            "\n\n"
+                        };
+                        self.editor.insert(&format!("{prefix}{text}{suffix}"));
+                        self.dirty = true;
+                        self.audio_panel = Some(panel);
+                        self.status =
+                            "inserted into the editor — Ctrl-S to save (nothing was written yet)"
+                                .into();
+                        return;
+                    }
+                    (Some(_), false) => {
+                        self.audio_panel = Some(panel);
+                        self.status =
+                            "open a chapter first (Enter in the tree), then press i".into();
+                        return;
+                    }
+                    (None, _) => {
+                        self.audio_panel = Some(panel);
+                        self.status = "nothing to insert — press t to transcribe first".into();
+                        return;
+                    }
+                }
+            }
+            // Send the reviewed text to the project dictation note — the
+            // explicit alternative to `i` (still the author's keystroke).
+            KeyCode::Char('n') if panel.rec.is_none() => {
+                let text = Self::active_dict_text(&panel);
+                let take = panel.takes.get(panel.sel).cloned();
+                match (text, take) {
+                    (Some(text), Some(take)) => {
+                        match oca_audio::dictation::add_to_notes(core, &take, &text) {
+                            Ok(path) => {
+                                self.audio_panel = Some(panel);
+                                self.status = format!("added to {}", path.display());
+                                return;
+                            }
+                            Err(e) => {
+                                self.audio_panel = Some(panel);
+                                self.status = format!("cannot add to notes: {e}");
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        self.audio_panel = Some(panel);
+                        self.status = "nothing to add — press t to transcribe first".into();
+                        return;
+                    }
+                }
             }
             KeyCode::Char('r') if panel.rec.is_none() => match audio.record() {
                 Ok(rec) => {
@@ -867,11 +1206,27 @@ impl App {
             }
             KeyCode::Down => {
                 if panel.sel + 1 < panel.takes.len() {
+                    if self.stop_dict_job(core, &mut panel) {
+                        panel.preview = None;
+                    }
                     panel.sel += 1;
+                    panel.transcript = panel.takes[panel.sel]
+                        .meta
+                        .transcript
+                        .as_ref()
+                        .map(|t| t.text.clone());
                 }
             }
-            KeyCode::Up => {
-                panel.sel = panel.sel.saturating_sub(1);
+            KeyCode::Up if panel.sel > 0 => {
+                if self.stop_dict_job(core, &mut panel) {
+                    panel.preview = None;
+                }
+                panel.sel -= 1;
+                panel.transcript = panel.takes[panel.sel]
+                    .meta
+                    .transcript
+                    .as_ref()
+                    .map(|t| t.text.clone());
             }
             _ => {}
         }
@@ -1672,7 +2027,11 @@ impl App {
         let Some(panel) = &self.audio_panel else {
             return;
         };
-        let area = centered(frame.area(), 78, 18);
+        // Grow when there's dictation text to review — the transcript is
+        // half the point of opening the panel.
+        let has_text = panel.transcript.is_some() || panel.preview.is_some();
+        let height = if has_text { 25 } else { 18 };
+        let area = centered(frame.area(), 78, height);
         let rec_badge = match &panel.rec {
             Some(rec) => match rec.state() {
                 RecState::Recording => "  ● RECORDING".to_string(),
@@ -1681,8 +2040,13 @@ impl App {
             None => String::new(),
         };
         let playing = if panel.player.is_some() { "  ♪" } else { "" };
+        let working = if panel.dict_job.is_some() {
+            "  ⟳ working (Esc stops)"
+        } else {
+            ""
+        };
         let block = Block::default().borders(Borders::ALL).title(format!(
-            " Audio — {}{rec_badge}{playing} ",
+            " Audio — {}{rec_badge}{playing}{working} ",
             panel.dir_rel.display()
         ));
         let inner = block.inner(area);
@@ -1710,8 +2074,13 @@ impl App {
                 .map(|a| a.describe())
                 .unwrap_or_else(|| "—".into());
             let note = if take.meta.note.is_some() { " ✎" } else { "" };
+            let transcript = if take.meta.transcript.is_some() {
+                " ≡"
+            } else {
+                ""
+            };
             let line = Line::from(format!(
-                "{marker}{:<22} {:>5.1}s  {}{note}",
+                "{marker}{:<22} {:>5.1}s  {}{note}{transcript}",
                 truncate(&take.stem(), 22),
                 take.duration_secs(),
                 attached
@@ -1723,6 +2092,39 @@ impl App {
             });
         }
         lines.push(Line::from(""));
+        // The active text: a cleanup preview under review, else the raw
+        // transcript. Shown, never applied — `i`/`n` are the say-so.
+        let active = match (&panel.preview, &panel.transcript) {
+            (Some(preview), _) => Some((
+                "cleanup preview — review before using (AI output is never written by itself)",
+                preview.as_str(),
+            )),
+            (None, Some(transcript)) => {
+                Some(("transcript — stored with the take", transcript.as_str()))
+            }
+            (None, None) => None,
+        };
+        if let Some((label, text)) = active {
+            lines.push(Line::styled(label, Style::new().fg(Color::DarkGray)));
+            let shown: Vec<&str> = text.lines().take(7).collect();
+            for l in &shown {
+                lines.push(Line::from(truncate(l.trim_end(), 74)));
+            }
+            if text.lines().count() > shown.len() || text.lines().count() == 0 {
+                lines.push(Line::styled("…", Style::new().fg(Color::DarkGray)));
+            }
+        }
+        lines.push(Line::from(""));
+        if has_text {
+            // Cleanup keys only exist for the author when a language model
+            // is installed (Phase 7B spec: the LLM options stay invisible
+            // otherwise — dictation itself never needs them).
+            let mut keys = "t transcribe · i insert · n to notes".to_string();
+            if self.ai.is_some() {
+                keys.push_str(" · c clean · p prose");
+            }
+            lines.push(Line::styled(keys, Style::new().fg(Color::DarkGray)));
+        }
         lines.push(Line::styled(
             "↑↓ select · Enter play · a attach · d delete · r record · p pause · s save · Esc close",
             Style::new().fg(Color::DarkGray),
@@ -2578,6 +2980,289 @@ hold on to the light
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Audio"), "panel title renders");
         assert!(text.contains("no takes yet"), "empty state renders");
+    }
+
+    // ---- dictation (Phase 7B) ---------------------------------------------
+
+    /// Tick until the audio panel reaches a condition (or fail loudly).
+    fn settle_audio(app: &mut App, core: &mut Core, ok: impl Fn(&AudioPanel) -> bool) {
+        for _ in 0..1_000 {
+            app.tick(core).unwrap();
+            if let Some(panel) = &app.audio_panel
+                && ok(panel)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("audio panel never reached the expected state");
+    }
+
+    fn dict_app(core: &Core, text: &str) -> App {
+        let mut app = App::new(
+            core,
+            Arc::new(MockHost::with_chunks(
+                oca_audio::AudioSpec::mono(8_000),
+                vec![vec![0.1; 40]],
+            )),
+        );
+        let text = text.to_string();
+        app.attach_transcriber(Arc::new(oca_audio::FnTranscriber::new(
+            "stand-in",
+            move |_wav: &std::path::Path, _c: &std::sync::atomic::AtomicBool| Ok(text.clone()),
+        )));
+        app
+    }
+
+    /// The Phase 7B headline: record → transcribe → insert works with a
+    /// stand-in runtime (no LLM anywhere), the transcript is stored with
+    /// the take, and **nothing enters the manuscript until `i` + Ctrl-S**.
+    #[test]
+    fn dictation_records_transcribes_and_inserts_only_when_asked() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        let mut app = dict_app(&core, "the lamp was lit");
+        app.open_doc(&mut core, rel.clone());
+        let editor_before = app.editor.text();
+        let body_before = core.read_document(&rel).unwrap().body().to_string();
+
+        // record → save → transcribe
+        app.focus = Focus::Tree;
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        assert!(
+            app.status.contains("transcribing with stand-in"),
+            "{}",
+            app.status
+        );
+        settle_audio(&mut app, &mut core, |p| {
+            p.dict_job.is_none() && p.transcript.is_some()
+        });
+        assert_eq!(
+            app.audio_panel.as_ref().unwrap().transcript.as_deref(),
+            Some("the lamp was lit")
+        );
+
+        // The raw transcript is stored with the take — and *nowhere else*:
+        // manuscript untouched, editor untouched, no notes file created.
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            body_before,
+            "a transcript never auto-inserts"
+        );
+        assert_eq!(app.editor.text(), editor_before);
+        assert!(
+            !tmp.path().join("notes/dictation.md").exists(),
+            "no notes by itself"
+        );
+        let sidecar = std::fs::read_to_string(tmp.path().join("audio/take-001.yaml")).unwrap();
+        assert!(sidecar.contains("transcript:"), "{sidecar}");
+        assert!(sidecar.contains("the lamp was lit"), "{sidecar}");
+
+        // The panel shows the transcript with its review-only framing.
+        {
+            let backend = TestBackend::new(100, 34);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| app.draw(&core, frame))
+                .expect("frame renders");
+            let buffer = terminal.backend().buffer();
+            let drawn: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(drawn.contains("transcript — stored"), "{drawn}");
+            assert!(drawn.contains("i insert"), "{drawn}");
+        }
+
+        // `i` inserts into the editor buffer only; the file changes only
+        // when the author saves.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        assert!(app.dirty, "insert marks the editor dirty");
+        let with_text = app.editor.text();
+        assert!(with_text.contains("the lamp was lit"), "{with_text}");
+        assert!(with_text.contains("# First"), "heading survives");
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            body_before,
+            "still not written anywhere"
+        );
+        app.on_key(&mut core, ctrl('s')).unwrap();
+        let saved = core.read_document(&rel).unwrap().body().to_string();
+        assert!(saved.contains("the lamp was lit"), "{saved}");
+        assert!(saved.contains("# First"), "{saved}");
+
+        // Files are canonical: closing and reopening the panel still shows
+        // the transcript (it was read from the sidecar, not memory).
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        assert_eq!(
+            app.audio_panel.as_ref().unwrap().transcript.as_deref(),
+            Some("the lamp was lit")
+        );
+    }
+
+    /// Rule 3: without a transcription runtime the panel still works and
+    /// `t` explains exactly what's missing instead of failing.
+    #[test]
+    fn t_without_a_transcriber_explains_itself() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        assert!(
+            app.status.contains("no dictation runtime"),
+            "actionable: {}",
+            app.status
+        );
+        let panel = app.audio_panel.as_ref().unwrap();
+        assert!(panel.transcript.is_none());
+        assert!(panel.dict_job.is_none(), "nothing was started");
+        assert!(
+            !std::fs::read_to_string(tmp.path().join("audio/take-001.yaml"))
+                .unwrap()
+                .contains("transcript:"),
+            "nothing stored"
+        );
+    }
+
+    /// An LLM cleanup is a *preview*: it streams into the panel for review
+    /// and touches nothing until the author inserts it (rule 4's stance
+    /// until proposals arrive in Phase 8).
+    #[test]
+    fn cleanup_streams_a_preview_that_only_inserts_when_asked() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        let mut app = dict_app(&core, "the lamp was lit");
+        let (_model, ai) = mock_ai(0, &["the lamp ", "was glowing"]);
+        app.attach_ai(ai);
+        app.open_doc(&mut core, rel.clone());
+        let body_before = core.read_document(&rel).unwrap().body().to_string();
+
+        app.focus = Focus::Tree;
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        settle_audio(&mut app, &mut core, |p| {
+            p.dict_job.is_none() && p.transcript.is_some()
+        });
+
+        // c starts the preview stream.
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        assert!(
+            app.status.contains("cleanup preview running"),
+            "{}",
+            app.status
+        );
+        settle_audio(&mut app, &mut core, |p| {
+            p.dict_job.is_none() && p.preview.as_deref() == Some("the lamp was glowing")
+        });
+        // Preview over raw transcript for insert purposes; nothing written.
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            body_before,
+            "a preview never writes by itself"
+        );
+        assert_eq!(app.editor.text(), core.read_document(&rel).unwrap().body());
+
+        // i inserts the *reviewed* text (the preview), not the raw one.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        let edited = app.editor.text();
+        assert!(edited.contains("the lamp was glowing"), "{edited}");
+        assert!(
+            !edited.contains("the lamp was lit"),
+            "raw not used: {edited}"
+        );
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            body_before,
+            "file untouched until Ctrl-S"
+        );
+    }
+
+    /// The LLM side is optional too: `c` without a model says so, and the
+    /// transcript stays exactly as it was.
+    #[test]
+    fn c_without_a_language_model_says_so() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = dict_app(&core, "the lamp was lit");
+
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        settle_audio(&mut app, &mut core, |p| {
+            p.dict_job.is_none() && p.transcript.is_some()
+        });
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        assert!(
+            app.status.contains("language model"),
+            "optional, not fatal: {}",
+            app.status
+        );
+        let panel = app.audio_panel.as_ref().unwrap();
+        assert_eq!(panel.transcript.as_deref(), Some("the lamp was lit"));
+        assert!(panel.preview.is_none());
+        assert!(panel.dict_job.is_none(), "no job started");
+    }
+
+    /// Esc stops a running transcription: nothing is stored, nothing is
+    /// shown as if it had succeeded.
+    #[test]
+    fn first_esc_stops_a_running_transcription() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _rel) = project_with_chapter(&tmp);
+        let mut app = App::new(
+            &core,
+            Arc::new(MockHost::with_chunks(
+                oca_audio::AudioSpec::mono(8_000),
+                vec![vec![0.1; 40]],
+            )),
+        );
+        app.attach_transcriber(Arc::new(oca_audio::FnTranscriber::new(
+            "slow",
+            |_wav: &std::path::Path, cancel: &std::sync::atomic::AtomicBool| {
+                for _ in 0..500 {
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(anyhow::anyhow!("stopped"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Ok("late text".to_string())
+            },
+        )));
+
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('t'))).unwrap();
+        assert!(app.audio_panel.as_ref().unwrap().dict_job.is_some());
+
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        let panel = app.audio_panel.as_ref().unwrap();
+        assert!(panel.dict_job.is_none(), "the job was cancelled");
+        assert_eq!(app.focus, Focus::Audio, "first Esc keeps the panel open");
+        assert!(app.status.contains("stopped"), "{}", app.status);
+
+        // Let a few ticks pass: nothing arrives, nothing is stored.
+        for _ in 0..10 {
+            app.tick(&mut core).unwrap();
+        }
+        let panel = app.audio_panel.as_ref().unwrap();
+        assert!(panel.transcript.is_none(), "no late transcript appears");
+        let sidecar = std::fs::read_to_string(tmp.path().join("audio/take-001.yaml")).unwrap();
+        assert!(!sidecar.contains("transcript:"), "{sidecar}");
+
+        // Second Esc closes as usual.
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.audio_panel.is_none());
     }
 
     // ---- search panel (Phase 5) -------------------------------------------

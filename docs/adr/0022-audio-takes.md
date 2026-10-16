@@ -59,6 +59,8 @@ anyway). Verified on real hardware: record → save → attach → play with
   without touching a device.
 - Deleting `.oca/cache` never touches takes; a take's links survive renames.
 - WAV-only in v1; symphonia formats arrive with Phase 7B dictation.
+  *(Update — ADR-0026: 7B ships dictation without touching import or
+  decode; takes stay WAV-only until import/export, Phase 15.)*
 - macOS/Windows (and any Linux quirk beyond the `/dev/snd` gate) device
   verification is the manual checklist in `docs/audio-device-checklist.md`
   — CI cannot test hardware.

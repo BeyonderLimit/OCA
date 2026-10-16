@@ -215,6 +215,61 @@ pub fn collect(
         },
     });
 
+    // Dictation (Phase 7B): whisper runtime + model — discovery only,
+    // never spawned, and deliberately independent of the LLM checks above
+    // (dictation works with no language model installed).
+    let whisper_models_dir = cfg
+        .ai
+        .whisper_models_dir
+        .clone()
+        .or_else(|| home.map(|h| h.join(".oca").join("models").join("whisper")))
+        .unwrap_or_else(oca_ai::default_whisper_models_dir);
+    let whisper_cli: Option<PathBuf> = match &cfg.ai.whisper_cli {
+        Some(path) if path.is_file() => Some(path.clone()),
+        Some(_) => None,
+        None => oca_ai::find_whisper_cli_in(&runtime_dir, std::env::var_os("PATH").as_deref()),
+    };
+    let whisper_configured_missing = cfg.ai.whisper_cli.as_ref().is_some_and(|p| !p.is_file());
+    let whisper_models = oca_ai::discover_whisper_models(&whisper_models_dir).unwrap_or_default();
+    checks.push(match (whisper_cli, whisper_models.is_empty()) {
+        (Some(cli), false) => Check {
+            ok: true,
+            label: "Dictation",
+            detail: format!(
+                "{} · {} (works with no language model)",
+                cli.display(),
+                whisper_models[0].name
+            ),
+        },
+        (None, _) if whisper_configured_missing => Check {
+            ok: false,
+            label: "Dictation",
+            detail: format!(
+                "configured path missing: {}",
+                cfg.ai
+                    .whisper_cli
+                    .as_deref()
+                    .unwrap_or(Path::new(""))
+                    .display()
+            ),
+        },
+        (None, _) => Check {
+            ok: false,
+            label: "Dictation",
+            detail:
+                "no whisper runtime — side-load with `oca runtime install --from <pack.tar.gz>`"
+                    .into(),
+        },
+        (Some(_), true) => Check {
+            ok: false,
+            label: "Dictation",
+            detail: format!(
+                "no model in {} — drop a whisper .gguf file in",
+                whisper_models_dir.display()
+            ),
+        },
+    });
+
     // Hardware tier recommendation (ADR-0008): tiers, not model names.
     {
         let hw = oca_ai::Hardware::detect();
@@ -388,6 +443,46 @@ mod tests {
         assert!(models.ok, "{}", models.detail);
         assert!(models.detail.contains("lyra-3b"), "{}", models.detail);
         assert!(models.detail.contains("2.0 KB"), "{}", models.detail);
+    }
+
+    #[test]
+    fn dictation_check_follows_runtime_and_model_independently() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        // Always explicit so the machine's PATH can't make this flaky.
+        let cli = tmp.path().join("whisper-cli");
+        std::fs::write(&cli, b"#!/bin/sh\n").unwrap();
+        cfg.ai.whisper_cli = Some(cli.clone());
+
+        // Runtime but no model → actionable warning (dictation is optional,
+        // and the check never touches the LLM rows above).
+        let checks = collect(&cfg, &logging_ok(), None, Some(tmp.path()));
+        let dict = checks.iter().find(|c| c.label == "Dictation").unwrap();
+        assert!(!dict.ok, "{}", dict.detail);
+        assert!(dict.detail.contains("no model in"), "{}", dict.detail);
+        assert!(dict.detail.contains("whisper"), "{}", dict.detail);
+
+        // Model too → green, promising no language model is needed.
+        let models = tmp.path().join(".oca").join("models").join("whisper");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("ggml-base.gguf"), vec![0u8; 128]).unwrap();
+        let checks = collect(&cfg, &logging_ok(), None, Some(tmp.path()));
+        let dict = checks.iter().find(|c| c.label == "Dictation").unwrap();
+        assert!(dict.ok, "{}", dict.detail);
+        assert!(dict.detail.contains("ggml-base"), "{}", dict.detail);
+        assert!(dict.detail.contains("no language model"), "{}", dict.detail);
+
+        // Configured path missing → reported as missing, never silently
+        // falling back to some other binary.
+        cfg.ai.whisper_cli = Some(tmp.path().join("no-such-whisper"));
+        let checks = collect(&cfg, &logging_ok(), None, Some(tmp.path()));
+        let dict = checks.iter().find(|c| c.label == "Dictation").unwrap();
+        assert!(!dict.ok, "{}", dict.detail);
+        assert!(
+            dict.detail.contains("configured path missing"),
+            "{}",
+            dict.detail
+        );
     }
 
     #[test]

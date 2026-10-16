@@ -141,6 +141,34 @@ pub enum Command {
         cmd: RuntimeCommand,
     },
 
+    /// Dictation (Phase 7B): transcribe a recorded take with whisper —
+    /// works with **no LLM installed**. The raw transcript is stored with
+    /// the take; it only goes further where you send it.
+    Dictate {
+        /// Take id, title, or filename stem (record one with
+        /// `oca audio record`).
+        take: String,
+        /// Also send the transcript somewhere: `notes` (append to
+        /// notes/dictation.md) or `chapter:<chapter>`. Without it, the raw
+        /// transcript is only stored with the take.
+        #[arg(long)]
+        into: Option<String>,
+        /// Preview an LLM cleanup of the transcript (needs a model; the
+        /// text is shown for review, never written to files).
+        #[arg(long)]
+        clean: bool,
+        /// Preview the transcript turned into prose (needs a model; shown
+        /// for review, never written to files).
+        #[arg(long)]
+        prose: bool,
+        /// Spoken language code for whisper (default: auto-detect).
+        #[arg(long)]
+        language: Option<String>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
     /// Report the health of each OCA subsystem (warnings are informational; exit 0).
     Doctor,
 }

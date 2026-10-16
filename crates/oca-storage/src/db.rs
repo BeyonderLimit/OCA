@@ -1184,6 +1184,11 @@ fn index_take(conn: &Connection, rel: &Path, path: &Path) -> Result<()> {
     let attach_kind = attached.and_then(|a| a.get("kind")).and_then(Value::as_str);
     let attach_id = attached.and_then(|a| a.get("id")).and_then(Value::as_str);
     let note = value.get("note");
+    let transcript = value
+        .get("transcript")
+        .and_then(|t| t.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let note_text = [
         note.and_then(|n| n.get("text"))
             .and_then(Value::as_str)
@@ -1197,6 +1202,7 @@ fn index_take(conn: &Connection, rel: &Path, path: &Path) -> Result<()> {
             .and_then(Value::as_i64)
             .map(|n| n.to_string())
             .unwrap_or_default(),
+        transcript.to_string(),
     ]
     .join("\n");
     conn.execute(
@@ -1351,6 +1357,37 @@ mod tests {
         assert_eq!(totals.songs, 1);
         assert_eq!(totals.takes, 1);
         assert_eq!(totals.events, 1);
+    }
+
+    /// A dictation transcript lives in its take sidecar (files are
+    /// canonical) and is searchable like every other text — "delete the DB
+    /// → reindex → identical results" holds for it too (rule 2).
+    #[test]
+    fn dictation_transcripts_are_searchable() {
+        let tmp = project();
+        let root = tmp.path();
+        write(
+            root,
+            "audio/dictation-1.yaml",
+            "take_id: take_d1\ntitle: Voice memo\nduration_ms: 12\n\
+             transcript:\n  text: the lamp was still lit in the hallway\n  created: '2026-10-16T09:00:00Z'\n",
+        );
+
+        let mut db = Db::open(root).unwrap();
+        db.reindex_all(root).unwrap();
+        let hits = db.search("hallway", 10).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, "audio");
+        assert!(hits[0].snippet.contains('‹'), "snippet marks the match");
+
+        // Rebuildability: same answers after the cache is thrown away.
+        drop(db);
+        std::fs::remove_file(root.join(".oca/cache/oca.db")).unwrap();
+        let mut db = Db::open(root).unwrap();
+        db.reindex_all(root).unwrap();
+        let again = db.search("hallway", 10).unwrap();
+        assert_eq!(again.len(), hits.len(), "identical results after a rebuild");
+        assert_eq!(again[0].rel, hits[0].rel);
     }
 
     /// The rebuildability contract: deleting the DB and reindexing yields

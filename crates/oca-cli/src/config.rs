@@ -43,6 +43,15 @@ pub struct AiFileConfig {
     pub gpu_layers: Option<u32>,
     /// Worker threads (0 = runtime's choice).
     pub threads: Option<u32>,
+    /// Explicit `whisper-cli` path for dictation (beats pack/PATH discovery).
+    pub whisper_cli: Option<PathBuf>,
+    /// Whisper models directory (default `~/.oca/models/whisper`).
+    pub whisper_models_dir: Option<PathBuf>,
+    /// Spoken language for transcription (`"auto"` = runtime detection).
+    pub whisper_language: Option<String>,
+    /// Replace the standard whisper arguments entirely — for test doubles
+    /// and nonstandard runtimes, mirroring `llama_server`'s behavior.
+    pub whisper_args: Option<Vec<String>>,
 }
 
 /// Fully merged configuration plus which layer files were read (for `doctor`).
@@ -89,12 +98,16 @@ impl Config {
             cfg.ai.context = ai.context.or(cfg.ai.context);
             cfg.ai.gpu_layers = ai.gpu_layers.or(cfg.ai.gpu_layers);
             cfg.ai.threads = ai.threads.or(cfg.ai.threads);
+            cfg.ai.whisper_cli = ai.whisper_cli.or(cfg.ai.whisper_cli);
+            cfg.ai.whisper_models_dir = ai.whisper_models_dir.or(cfg.ai.whisper_models_dir);
+            cfg.ai.whisper_language = ai.whisper_language.or(cfg.ai.whisper_language);
+            cfg.ai.whisper_args = ai.whisper_args.or(cfg.ai.whisper_args);
             cfg.sources.push(path.to_path_buf());
         }
         Ok(cfg)
     }
 
-    /// What `oca_ai::bootstrap` needs, from the merged `[ai]` section.
+    /// What the AI/dictation bootstrap needs, from the merged `[ai]` section.
     pub fn bootstrap_options(&self) -> oca_ai::BootstrapOptions {
         oca_ai::BootstrapOptions {
             models_dir: self.ai.models_dir.clone(),
@@ -103,6 +116,10 @@ impl Config {
             context: self.ai.context,
             gpu_layers: self.ai.gpu_layers,
             threads: self.ai.threads,
+            whisper_cli: self.ai.whisper_cli.clone(),
+            whisper_models_dir: self.ai.whisper_models_dir.clone(),
+            whisper_language: self.ai.whisper_language.clone(),
+            whisper_args: self.ai.whisper_args.clone(),
         }
     }
 
@@ -229,18 +246,33 @@ mod tests {
         let project = dir.path().join("project.toml");
         write(
             &global,
-            "log_level = \"info\"\n\n[ai]\ncontext = 4096\ngpu_layers = 0\nmodels_dir = \"/models\"\n",
+            "log_level = \"info\"\n\n[ai]\ncontext = 4096\ngpu_layers = 0\nmodels_dir = \"/models\"\n\
+             whisper_language = \"en\"\n",
         );
-        write(&project, "[ai]\ngpu_layers = 20\nthreads = 6\n");
+        write(
+            &project,
+            "[ai]\ngpu_layers = 20\nthreads = 6\nwhisper_cli = \"/bin/whisper-cli\"\nwhisper_args = [\"--fake\"]\n",
+        );
         let cfg = Config::load(Some(&global), Some(&project)).unwrap();
         assert_eq!(cfg.ai.context, Some(4096));
         assert_eq!(cfg.ai.gpu_layers, Some(20), "project overrides global");
         assert_eq!(cfg.ai.threads, Some(6));
         assert_eq!(cfg.ai.models_dir.as_deref(), Some(Path::new("/models")));
+        assert_eq!(cfg.ai.whisper_language.as_deref(), Some("en"));
 
         let opts = cfg.bootstrap_options();
         assert_eq!(opts.context, Some(4096));
         assert_eq!(opts.gpu_layers, Some(20));
+        assert_eq!(
+            opts.whisper_cli.as_deref(),
+            Some(Path::new("/bin/whisper-cli"))
+        );
+        assert_eq!(
+            opts.whisper_args,
+            Some(vec!["--fake".to_string()]),
+            "whisper_args replaces the standard arguments"
+        );
+        assert_eq!(opts.whisper_language.as_deref(), Some("en"));
 
         // Unknown key inside [ai] is still a hard error.
         let bad = dir.path().join("bad.toml");
