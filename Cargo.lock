@@ -1358,6 +1358,10 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "libc",
+ "oca-core",
+ "oca-model",
+ "oca-music",
+ "oca-story",
  "serde",
  "serde_json",
  "sha2",
@@ -1419,7 +1423,11 @@ dependencies = [
  "oca-model",
  "oca-storage",
  "oca-versioning",
+ "serde",
+ "serde_yaml",
+ "sha2",
  "tempfile",
+ "time",
  "tracing",
 ]
 

@@ -56,9 +56,11 @@
   first"), and the cleanup keys appear in the TUI footer only when a
   language model is installed. There is no proposal machinery in 7B:
   applying cleaned text is still the author pressing `i`/`n` or typing
-  `--into` themselves. When proposals land (Phase 8, A5), any
-  "apply the cleanup" path becomes a proposal with a pre-apply
-  auto-snapshot (Phase 6 hook) like every other AI write.
+  `--into` themselves. *(Update, Phase 8: the proposal machinery now
+  exists in `oca-core` — ADR-0027 — so the "apply the cleanup" path
+  becomes a proposal with a pre-apply auto-snapshot (Phase 6 hook) as
+  soon as the universal proposal UX lands in Phase 9. Until then the
+  preview-only stance stands, unchanged.)*
 
 ## Consequences
 

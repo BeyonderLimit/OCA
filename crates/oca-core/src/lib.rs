@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use oca_model::{Document, DocumentKind, ProjectKind, ProjectMeta};
 use oca_storage::Project;
 use oca_versioning::SnapshotStore;
@@ -25,11 +25,14 @@ pub use oca_storage::journal::RecoveryEntry;
 pub use oca_versioning::{
     ChangeKind, DiffReport, FileDiff, RestoreReport, SnapshotInfo, format_time,
 };
+/// Proposal types (A5, Phase 8) — AI output applies only through these.
+pub use proposal::{ManifestEntry, Proposal, ProposalStatus, ProposalTarget};
 
 mod jobs;
 /// Background jobs (ADR-0006) flow through Core like everything else —
 /// frontends spawn/cancel/query without owning thread logic.
 pub use jobs::{JobCancel, JobContext, JobSnapshot, JobState, Jobs, Priority};
+pub mod proposal;
 
 /// Mutations, expressible as data (later: serializable to a GUI wire format).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +84,30 @@ pub enum Command {
     SnapshotRestore {
         n: usize,
     },
+    /// Record AI output as a proposal (A5, rule 4): nothing is written to
+    /// the target document yet, and `base_checksum` pins the anchor text
+    /// the generation saw.
+    ProposalCreate {
+        operation: String,
+        prompt_version: String,
+        model: String,
+        document: PathBuf,
+        /// Byte range in the document body the payload replaces.
+        start: usize,
+        end: usize,
+        payload: String,
+        context_manifest: Vec<ManifestEntry>,
+    },
+    /// Apply a pending proposal: an auto-snapshot first, then in place if
+    /// the anchor still sits at the recorded range, rebased if the anchor
+    /// survives elsewhere, otherwise `stale` — never a silent overwrite.
+    ProposalApply {
+        id: String,
+    },
+    /// Mark a pending proposal rejected (kept for audit, never applied).
+    ProposalReject {
+        id: String,
+    },
 }
 
 /// Everything observable that happened. Frontends render these; tests assert
@@ -122,6 +149,23 @@ pub enum Event {
         removed: usize,
         unchanged: usize,
         audio_differing: Vec<PathBuf>,
+    },
+    ProposalCreated {
+        id: String,
+        operation: String,
+    },
+    ProposalApplied {
+        id: String,
+        /// The anchor had moved within the document and was found once.
+        rebased: bool,
+    },
+    ProposalRejected {
+        id: String,
+    },
+    /// The target changed in a way that leaves no safe place to apply —
+    /// the author's edits win; offer re-diff or regenerate.
+    ProposalStale {
+        id: String,
     },
 }
 
@@ -298,6 +342,120 @@ impl Core {
                     audio_differing: report.audio_differing,
                 }]
             }
+            Command::ProposalCreate {
+                operation,
+                prompt_version,
+                model,
+                document,
+                start,
+                end,
+                payload,
+                context_manifest,
+            } => {
+                let root = self.snapshot_root("record AI proposals")?;
+                let body = self
+                    .project
+                    .as_ref()
+                    .expect("open after snapshot_root check")
+                    .read_document(&document)?
+                    .body()
+                    .to_string();
+                let anchor = proposal::anchor_at(&body, start, end)?;
+                let created = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .context("timestamp")?;
+                let p = proposal::Proposal {
+                    id: oca_model::new_id("prop").to_string(),
+                    base_checksum: proposal::checksum(&anchor),
+                    operation,
+                    prompt_version,
+                    model,
+                    created,
+                    target: proposal::ProposalTarget {
+                        document,
+                        start,
+                        end,
+                        anchor,
+                    },
+                    context_manifest,
+                    payload,
+                    status: proposal::ProposalStatus::Pending,
+                };
+                proposal::save(&root, &p)?;
+                tracing::debug!(id = %p.id, operation = %p.operation, "AI proposal recorded");
+                vec![Event::ProposalCreated {
+                    id: p.id,
+                    operation: p.operation,
+                }]
+            }
+            Command::ProposalApply { id } => {
+                let root = self.snapshot_root("apply AI proposals")?;
+                let mut p = proposal::load(&root, &id)?;
+                if p.status != proposal::ProposalStatus::Pending {
+                    anyhow::bail!(
+                        "proposal {id} is {} — only pending proposals apply",
+                        p.status.as_str()
+                    );
+                }
+                let doc = self
+                    .project
+                    .as_ref()
+                    .expect("open after snapshot_root check")
+                    .read_document(&p.target.document)?;
+                let body = doc.body().to_string();
+                match proposal::locate(&body, &p.target) {
+                    proposal::Locate::Stale => {
+                        // The author's edits win — never apply over them.
+                        p.status = proposal::ProposalStatus::Stale;
+                        proposal::save(&root, &p)?;
+                        tracing::warn!(id = %id, "AI proposal went stale");
+                        vec![Event::ProposalStale { id }]
+                    }
+                    proposal::Locate::Range {
+                        start,
+                        end,
+                        rebased,
+                    } => {
+                        // Auto-snapshot first — the same hook restore uses.
+                        // If the current state cannot be saved, the apply is
+                        // refused.
+                        self.store
+                            .create(
+                                &root,
+                                Some(&format!(
+                                    "Before applying AI proposal ({})",
+                                    p.operation
+                                )),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "cannot save the current state before applying ({e}) — apply refused"
+                                )
+                            })?;
+                        let new_body = format!("{}{}{}", &body[..start], p.payload, &body[end..]);
+                        let raw = oca_markdown::with_body(&doc, &new_body);
+                        self.project_mut()?
+                            .save_document(&p.target.document, &raw)?;
+                        p.status = proposal::ProposalStatus::Accepted;
+                        proposal::save(&root, &p)?;
+                        tracing::info!(id = %id, rebased, "AI proposal applied");
+                        vec![Event::ProposalApplied { id, rebased }]
+                    }
+                }
+            }
+            Command::ProposalReject { id } => {
+                let root = self.snapshot_root("reject AI proposals")?;
+                let mut p = proposal::load(&root, &id)?;
+                if p.status != proposal::ProposalStatus::Pending {
+                    anyhow::bail!(
+                        "proposal {id} is {} — only pending proposals can be rejected",
+                        p.status.as_str()
+                    );
+                }
+                p.status = proposal::ProposalStatus::Rejected;
+                proposal::save(&root, &p)?;
+                vec![Event::ProposalRejected { id }]
+            }
         };
 
         for event in &events {
@@ -424,6 +582,26 @@ impl Core {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
         project.search(query, limit)
+    }
+
+    // ---- AI proposals (A5, Phase 8): list and fetch -----------------------
+
+    /// Every proposal on disk, in creation order. Listing never mutates.
+    pub fn proposals(&self) -> Result<Vec<Proposal>> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+        proposal::list(project.root())
+    }
+
+    /// One proposal by id (`None` when it isn't there).
+    pub fn proposal(&self, id: &str) -> Result<Option<Proposal>> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+        proposal::load_opt(project.root(), id)
     }
 
     /// Rebuild the whole cache index from the filesystem.
@@ -800,5 +978,289 @@ mod tests {
         // Queries still work read-only; only mutations are refused.
         assert!(other.snapshots().unwrap().is_empty());
         assert!(other.execute(Command::SnapshotRestore { n: 1 }).is_err());
+    }
+
+    // ---- proposals (A5, Phase 8) ------------------------------------------
+
+    /// A one-chapter project whose body contains `text`.
+    fn chapter_core(dir: &TempDir, text: &str) -> (Core, PathBuf) {
+        let mut core = opened_core(dir);
+        let events = core
+            .execute(Command::CreateDocument {
+                kind: DocumentKind::Chapter,
+                title: "First".into(),
+            })
+            .unwrap();
+        let Event::DocumentCreated { rel, .. } = &events[0] else {
+            panic!("expected DocumentCreated: {events:?}");
+        };
+        let rel = rel.clone();
+        core.save_body(&rel, text).unwrap();
+        (core, rel)
+    }
+
+    /// A pending proposal replacing `from` with `to` inside `body`.
+    fn proposal_create(
+        core: &mut Core,
+        rel: &Path,
+        body: &str,
+        from: &str,
+        to: &str,
+    ) -> (String, String) {
+        let start = body.find(from).expect("anchor in body");
+        let events = core
+            .execute(Command::ProposalCreate {
+                operation: "rewrite_selection".into(),
+                prompt_version: "rewrite/1".into(),
+                model: "mock".into(),
+                document: rel.to_path_buf(),
+                start,
+                end: start + from.len(),
+                payload: to.into(),
+                context_manifest: vec![ManifestEntry {
+                    label: "chapter".into(),
+                    source: "ch_first".into(),
+                }],
+            })
+            .unwrap();
+        let Event::ProposalCreated { id, operation } = &events[0] else {
+            panic!("expected ProposalCreated: {events:?}");
+        };
+        assert_eq!(operation, "rewrite_selection");
+        (id.clone(), body[start..start + from.len()].to_string())
+    }
+
+    #[test]
+    fn proposal_apply_in_place_after_auto_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let body = "She said hello to the world.\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+        let (id, anchor) = proposal_create(&mut core, &rel, body, "world", "forest");
+
+        let stored = core.proposal(&id).unwrap().unwrap();
+        assert_eq!(stored.status, ProposalStatus::Pending);
+        assert_eq!(stored.base_checksum, proposal::checksum(&anchor));
+        assert_eq!(stored.context_manifest.len(), 1);
+
+        let events = core
+            .execute(Command::ProposalApply { id: id.clone() })
+            .unwrap();
+        assert!(
+            matches!(events[0], Event::ProposalApplied { rebased: false, .. }),
+            "{events:?}"
+        );
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            "She said hello to the forest.\n"
+        );
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            ProposalStatus::Accepted
+        );
+
+        // The apply took an auto-snapshot of the pre-apply state first.
+        let list = core.snapshots().unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(
+            list[0].label.contains("Before applying AI proposal"),
+            "{:?}",
+            list[0].label
+        );
+
+        // A second apply refuses — the proposal is spent.
+        let err = core
+            .execute(Command::ProposalApply { id })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pending"), "{err}");
+    }
+
+    #[test]
+    fn proposal_rebases_when_the_document_changed_around_it() {
+        let tmp = TempDir::new().unwrap();
+        let body = "She said hello to the world.\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+        let (id, _) = proposal_create(&mut core, &rel, body, "world", "forest");
+
+        // The author keeps typing: the recorded range no longer holds the
+        // anchor, but the anchor itself is intact.
+        core.save_body(&rel, "Later, she thought of the world again.\n")
+            .unwrap();
+
+        let events = core.execute(Command::ProposalApply { id }).unwrap();
+        assert!(
+            matches!(events[0], Event::ProposalApplied { rebased: true, .. }),
+            "{events:?}"
+        );
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            "Later, she thought of the forest again.\n"
+        );
+    }
+
+    #[test]
+    fn proposal_goes_stale_rather_than_clobbering_edits() {
+        let tmp = TempDir::new().unwrap();
+        let body = "She said hello to the world.\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+        let (id, _) = proposal_create(&mut core, &rel, body, "world", "forest");
+
+        // The author edited the anchor sentence itself.
+        core.save_body(&rel, "She said hello to a different place.\n")
+            .unwrap();
+
+        let events = core
+            .execute(Command::ProposalApply { id: id.clone() })
+            .unwrap();
+        assert!(
+            matches!(events[0], Event::ProposalStale { .. }),
+            "{events:?}"
+        );
+        // Nothing was written to the document.
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            "She said hello to a different place.\n"
+        );
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            ProposalStatus::Stale
+        );
+        // Stale proposals never apply, not even later.
+        assert!(core.execute(Command::ProposalApply { id }).is_err());
+    }
+
+    #[test]
+    fn proposal_ambiguous_anchor_never_guesses() {
+        let tmp = TempDir::new().unwrap();
+        let body = "say world today\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+        let (id, _) = proposal_create(&mut core, &rel, body, "world", "forest");
+        // The author's edit moves the range and leaves two surviving copies
+        // of the anchor — never guess between them.
+        let edited = "world: say world today\n";
+        core.save_body(&rel, edited).unwrap();
+        let events = core.execute(Command::ProposalApply { id }).unwrap();
+        assert!(
+            matches!(events[0], Event::ProposalStale { .. }),
+            "{events:?}"
+        );
+        assert_eq!(core.read_document(&rel).unwrap().body(), edited);
+    }
+
+    #[test]
+    fn proposal_empty_anchor_inserts_only_at_its_point() {
+        let tmp = TempDir::new().unwrap();
+        let body = "First paragraph.\n\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+        let events = core
+            .execute(Command::ProposalCreate {
+                operation: "continue_scene".into(),
+                prompt_version: "continue/1".into(),
+                model: "mock".into(),
+                document: rel.clone(),
+                start: body.len(),
+                end: body.len(),
+                payload: "Second paragraph.\n".into(),
+                context_manifest: vec![],
+            })
+            .unwrap();
+        let Event::ProposalCreated { id, .. } = &events[0] else {
+            panic!("expected ProposalCreated: {events:?}");
+        };
+        let id = id.clone();
+        let events = core.execute(Command::ProposalApply { id }).unwrap();
+        assert!(
+            matches!(events[0], Event::ProposalApplied { rebased: false, .. }),
+            "{events:?}"
+        );
+        assert_eq!(
+            core.read_document(&rel).unwrap().body(),
+            "First paragraph.\n\nSecond paragraph.\n"
+        );
+    }
+
+    #[test]
+    fn proposal_reject_and_validation() {
+        let tmp = TempDir::new().unwrap();
+        let body = "one two three\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+
+        // Range validation happens at record time.
+        for (start, end) in [(5, 3), (0, 999)] {
+            let err = core
+                .execute(Command::ProposalCreate {
+                    operation: "rewrite_selection".into(),
+                    prompt_version: "rewrite/1".into(),
+                    model: "mock".into(),
+                    document: rel.clone(),
+                    start,
+                    end,
+                    payload: "x".into(),
+                    context_manifest: vec![],
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("range"), "{err}");
+        }
+
+        let (id, _) = proposal_create(&mut core, &rel, body, "two", "2");
+        assert!(core.proposal("nope").unwrap().is_none());
+        assert_eq!(core.proposals().unwrap().len(), 1);
+
+        let events = core
+            .execute(Command::ProposalReject { id: id.clone() })
+            .unwrap();
+        assert!(matches!(events[0], Event::ProposalRejected { .. }));
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            ProposalStatus::Rejected
+        );
+        // Rejected proposals never apply.
+        let err = core
+            .execute(Command::ProposalApply { id })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rejected"), "{err}");
+    }
+
+    #[test]
+    fn proposals_refuse_read_only_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let body = "hello\n";
+        let (core, rel) = chapter_core(&tmp, body);
+        drop(core);
+
+        let mut writer = Core::new();
+        writer
+            .execute(Command::OpenProject {
+                root: tmp.path().to_path_buf(),
+            })
+            .unwrap();
+        assert!(!writer.is_read_only());
+
+        // A second session can't take the lock: read-only.
+        let mut reader = Core::new();
+        reader
+            .execute(Command::OpenProject {
+                root: tmp.path().to_path_buf(),
+            })
+            .unwrap();
+        assert!(reader.is_read_only());
+        let err = reader
+            .execute(Command::ProposalCreate {
+                operation: "rewrite_selection".into(),
+                prompt_version: "rewrite/1".into(),
+                model: "mock".into(),
+                document: rel.clone(),
+                start: 0,
+                end: 5,
+                payload: "bye".into(),
+                context_manifest: vec![],
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read-only"), "{err}");
+        // Listing still works read-only.
+        assert!(reader.proposals().unwrap().is_empty());
     }
 }

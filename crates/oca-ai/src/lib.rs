@@ -30,6 +30,14 @@ mod packs;
 mod subprocess;
 mod whisper;
 
+pub mod context;
+
+pub use context::{
+    AlbumContext, ArtistContext, ChapterContext, ChapterRef, CharacterContext, ContextItem,
+    IntoContext, ManuscriptContext, PRIORITY_BACKGROUND, PRIORITY_PRIMARY, PRIORITY_SUPPORTING,
+    Prompt, PromptBuilder, Retriever, SYSTEM_PREAMBLE, SceneContext, SongContext, SongSection,
+    Source, WorldContext, WorldEntity, estimate_tokens,
+};
 pub use hardware::{Hardware, Tier};
 pub use mock::MockModel;
 #[doc(hidden)]

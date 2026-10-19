@@ -14,6 +14,10 @@ oca-markdown.workspace = true
 oca-model.workspace = true
 oca-storage.workspace = true
 oca-versioning.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+time.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
