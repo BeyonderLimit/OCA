@@ -25,12 +25,23 @@ pub struct Counters {
 pub struct MockModel {
     info: ModelInfo,
     tokens: Vec<String>,
+    /// Request-aware canned responses, tried in order: the first pattern
+    /// found in the prompt (or system) wins. Empty = plain `tokens`.
+    scripts: Vec<Script>,
     delay: Duration,
     loaded: AtomicBool,
     cancelled: AtomicBool,
     counters: Mutex<Counters>,
     fail_load: Option<String>,
     fail_generate: Option<String>,
+}
+
+/// One canned response: match when the prompt or system contains `find`,
+/// then stream `then` as tokens.
+#[derive(Clone, Debug)]
+pub struct Script {
+    pub find: String,
+    pub then: Vec<String>,
 }
 
 impl Default for MockModel {
@@ -56,6 +67,7 @@ impl MockModel {
                 " mock".into(),
                 ".".into(),
             ],
+            scripts: Vec::new(),
             delay: Duration::from_millis(0),
             loaded: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -68,6 +80,61 @@ impl MockModel {
     pub fn with_tokens(mut self, tokens: Vec<String>) -> Self {
         self.tokens = tokens;
         self
+    }
+
+    /// Request-aware canned responses, tried in order (Phase 9 ops).
+    pub fn with_scripts(mut self, scripts: Vec<Script>) -> Self {
+        self.scripts = scripts;
+        self
+    }
+
+    /// The canned model every story-AI test runs against: recognizes each
+    /// Phase 9 operation by the `Operation:` line its prompt carries and
+    /// answers with output that satisfies that operation's contract
+    /// (valid JSON for the schema ops).
+    pub fn story_defaults() -> Self {
+        fn tokens(text: &str) -> Vec<String> {
+            text.split_inclusive(char::is_whitespace)
+                .map(str::to_string)
+                .collect()
+        }
+        Self::new().with_scripts(vec![
+            Script {
+                find: "Operation: continue_scene".into(),
+                then: tokens(
+                    " The storm broke over the harbor before anyone could reach the boats.",
+                ),
+            },
+            Script {
+                find: "Operation: rewrite_selection".into(),
+                then: tokens("Elena read the letter twice; Marcus waited by the door."),
+            },
+            Script {
+                find: "Operation: summarize_chapter".into(),
+                then: tokens(
+                    "Elena receives a letter that names no sender. Marcus claims he \
+                     found it in the archive; she does not believe him. They argue, \
+                     and she hides the letter inside the hall.",
+                ),
+            },
+            Script {
+                find: "Operation: generate_outline".into(),
+                then: tokens(
+                    "{\"sections\":[{\"title\":\"Act I — The Letter\",\"beats\":[\
+                     \"Elena receives the letter\",\"Marcus lies about the archive\",\
+                     \"The elders convene at the hall\"]}]}",
+                ),
+            },
+            Script {
+                find: "Operation: review_chapter".into(),
+                then: tokens(
+                    "{\"issues\":[{\"type\":\"timeline\",\"severity\":\"warning\",\
+                     \"location\":\"paragraph 2\",\"explanation\":\"The letter is \
+                     said to arrive after market day, yet the market scene already \
+                     references its contents.\"}]}",
+                ),
+            },
+        ])
     }
 
     pub fn with_delay(mut self, ms: u64) -> Self {
@@ -112,7 +179,7 @@ impl LanguageModel for MockModel {
 
     fn generate(
         &self,
-        _request: &GenerationRequest,
+        request: &GenerationRequest,
         sink: &mut dyn FnMut(&str),
     ) -> Result<GenerationOutcome> {
         if !self.is_loaded() {
@@ -124,10 +191,20 @@ impl LanguageModel for MockModel {
         self.counters.lock().expect("mock counters").generate += 1;
         self.cancelled.store(false, Ordering::SeqCst);
 
+        // Request-aware scripts first (Phase 9 operations), else canned.
+        let scripted = self.scripts.iter().find(|s| {
+            request.prompt.contains(&s.find)
+                || request
+                    .system
+                    .as_deref()
+                    .is_some_and(|system| system.contains(&s.find))
+        });
+        let source: &[String] = scripted.map(|s| s.then.as_slice()).unwrap_or(&self.tokens);
+
         let mut text = String::new();
         let mut tokens = 0u32;
         let mut stopped = false;
-        for token in &self.tokens {
+        for token in source {
             if self.cancelled.load(Ordering::SeqCst) {
                 stopped = true;
                 break;

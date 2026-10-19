@@ -60,7 +60,12 @@
   exists in `oca-core` — ADR-0027 — so the "apply the cleanup" path
   becomes a proposal with a pre-apply auto-snapshot (Phase 6 hook) as
   soon as the universal proposal UX lands in Phase 9. Until then the
-  preview-only stance stands, unchanged.)*
+  preview-only stance stands, unchanged.)* **Delivered, Phase 9
+  (ADR-0028):** the universal proposal UX exists — `p` panel, `oca
+  proposal apply`, Edit via `ProposalRevise` — so dictation cleanup
+  *can* become a proposal when dictation next changes. Phase 9 itself
+  did not rework dictation: cleanup output is still a preview, and
+  applying it is still the author's explicit `i`/`n`/`--into` press.
 
 ## Consequences
 

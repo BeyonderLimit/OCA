@@ -1432,6 +1432,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "oca-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oca-ai",
+ "oca-core",
+ "oca-model",
+ "oca-story",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "oca-markdown"
 version = "0.1.0"
 dependencies = [

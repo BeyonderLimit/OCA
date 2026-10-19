@@ -66,6 +66,11 @@ impl ProposalStatus {
             ProposalStatus::Edited => "edited",
         }
     }
+
+    /// Not yet decided by the author: still applicable and rejectable.
+    pub fn is_undecided(self) -> bool {
+        matches!(self, ProposalStatus::Pending | ProposalStatus::Edited)
+    }
 }
 
 /// A first-class AI output (A5): replacement text with everything needed

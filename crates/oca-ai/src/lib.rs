@@ -31,6 +31,7 @@ mod subprocess;
 mod whisper;
 
 pub mod context;
+pub mod operations;
 
 pub use context::{
     AlbumContext, ArtistContext, ChapterContext, ChapterRef, CharacterContext, ContextItem,
@@ -39,7 +40,16 @@ pub use context::{
     Source, WorldContext, WorldEntity, estimate_tokens,
 };
 pub use hardware::{Hardware, Tier};
-pub use mock::MockModel;
+pub use mock::{MockModel, Script};
+pub use operations::{
+    CONTINUE_SCENE, DEFAULT_BUDGET, Draft, DraftTarget, GENERATE_OUTLINE, OperationSpec, Outline,
+    OutlineSection, PayloadFormat, Prepared, REVIEW_CHAPTER, REWRITE_SELECTION, Review,
+    ReviewIssue, SUMMARIZE_CHAPTER, complete, create_proposal,
+    outline_schema as outline_json_schema, parse_outline, parse_review, prepare_continue_scene,
+    prepare_generate_outline, prepare_review_chapter, prepare_rewrite_selection,
+    prepare_summarize_chapter, render_outline, render_review, repair_json,
+    review_schema as review_json_schema,
+};
 #[doc(hidden)]
 pub use packs::pack_writer;
 pub use packs::{
@@ -399,11 +409,22 @@ pub struct BootstrapOptions {
     /// Replace the standard whisper arguments entirely — test doubles and
     /// nonstandard runtimes, mirroring [`ModelConfig::server_args`].
     pub whisper_args: Option<Vec<String>>,
+    /// Use the built-in scripted model (`MockModel::story_defaults`) — for
+    /// offline demos and tests; no runtime or model files involved.
+    pub mock: bool,
 }
 
 /// Build the AI facade if a runtime *and* a model are present; `None` means
 /// "no AI available" — every feature keeps working without it (rule 3).
 pub fn bootstrap(opts: &BootstrapOptions) -> Result<Option<Ai>> {
+    // The offline/demo path (Phase 9): the built-in scripted model, which
+    // needs no runtime and no model files — deleting them cannot break it.
+    if opts.mock {
+        return Ok(Some(Ai::new(
+            Arc::new(MockModel::story_defaults()),
+            Vec::new(),
+        )));
+    }
     let runtime_dir = opts.runtime_dir.clone().unwrap_or_else(default_runtime_dir);
     let server = match &opts.llama_server {
         Some(explicit) if explicit.is_file() => Some(explicit.clone()),
@@ -588,6 +609,16 @@ impl Ai {
         self.inner.model.generate(&request, &mut |token| {
             let _ = tx.send(token.to_string());
         })
+    }
+
+    /// Blocking generation streaming into `sink` — the shape the
+    /// operation pipeline, the CLI, and evals use directly.
+    pub fn generate_with(
+        &self,
+        request: &GenerationRequest,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<GenerationOutcome> {
+        self.inner.model.generate(request, sink)
     }
 
     /// The residency policy, for `doctor` and the panel.

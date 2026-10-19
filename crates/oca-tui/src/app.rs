@@ -45,6 +45,9 @@ enum Focus {
     Snapshots,
     /// The AI panel (runtime status, Load/Unload, streaming probe) is open.
     Ai,
+    /// The AI proposals panel (Phase 9): the list plus a side-by-side
+    /// review with accept / reject / edit.
+    Proposals,
 }
 
 enum TreeItem {
@@ -195,6 +198,12 @@ struct AiPanel {
     rx: Option<std::sync::mpsc::Receiver<String>>,
     /// Last load/probe failure, shown in red until the next action.
     error: Option<String>,
+    /// Set while a Phase 9 story operation streams instead of a probe.
+    op: Option<OpKind>,
+    /// The finished operation draft, handed over by the job thread.
+    op_slot: Arc<std::sync::Mutex<Option<oca_ai::Draft>>>,
+    /// A review report to display (a report is never a proposal).
+    report: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +216,53 @@ enum AiState {
     Ready,
     /// Probe streaming right now.
     Streaming,
+}
+
+/// Which Phase 9 story operation a streaming job is producing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpKind {
+    Continue,
+    Rewrite,
+    Summarize,
+    Outline,
+    Review,
+}
+
+impl OpKind {
+    /// The operation name proposals are recorded under.
+    fn name(self) -> &'static str {
+        match self {
+            OpKind::Continue => oca_ai::CONTINUE_SCENE.name,
+            OpKind::Rewrite => oca_ai::REWRITE_SELECTION.name,
+            OpKind::Summarize => oca_ai::SUMMARIZE_CHAPTER.name,
+            OpKind::Outline => oca_ai::GENERATE_OUTLINE.name,
+            OpKind::Review => oca_ai::REVIEW_CHAPTER.name,
+        }
+    }
+}
+
+/// The AI proposals panel (Phase 9): the proposal list, plus a side-by-side
+/// review — current draft on the left, proposed revision on the right —
+/// with Accept / Reject / Edit. Every decision goes through Core (rule 8);
+/// the TUI holds no proposal logic of its own.
+struct ProposalPanel {
+    proposals: Vec<oca_core::Proposal>,
+    sel: usize,
+    mode: PropMode,
+}
+
+enum PropMode {
+    List,
+    /// Side-by-side review of the selected proposal. `editing` is the
+    /// payload editor while the author has pressed `e`.
+    Detail {
+        original: String,
+        proposed: String,
+        scroll: u16,
+        /// Boxed: the rope editor is heavy — it belongs on the heap while
+        /// an edit is in progress, not inside every mode switch.
+        editing: Option<Box<Editor>>,
+    },
 }
 
 /// Present while a song's `lyrics.md` is open: the language its lyric tools
@@ -245,6 +301,8 @@ pub struct App {
     ai: Option<Ai>,
     /// Present while the AI panel is open.
     ai_panel: Option<AiPanel>,
+    /// Present while the AI proposals panel is open (Phase 9).
+    proposal_panel: Option<ProposalPanel>,
     /// Dictation (Phase 7B): the injected whisper seam — `None` means no
     /// transcription runtime, which only ever disables `t`/`c`/`p` with an
     /// explanation (rule 3: never required).
@@ -288,6 +346,7 @@ impl App {
             snap_panel: None,
             ai: None,
             ai_panel: None,
+            proposal_panel: None,
             transcriber: None,
             last_reconcile: Instant::now(),
             last_journal: Instant::now(),
@@ -600,10 +659,15 @@ impl App {
             job: None,
             rx: None,
             error: None,
+            op: None,
+            op_slot: Arc::new(std::sync::Mutex::new(None)),
+            report: None,
         });
         self.focus = Focus::Ai;
         self.status = if self.ai.is_some() {
-            "AI panel — l load, u unload, t probe, Esc close".into()
+            "AI panel — l load, u unload, t probe · c continue, w rewrite, s summarize, \
+             o outline, r review · Esc close"
+                .into()
         } else {
             "AI panel — no runtime installed (AI is optional)".into()
         };
@@ -625,6 +689,7 @@ impl App {
                         core.cancel_job(job);
                     }
                     panel.state = AiState::Ready;
+                    panel.op = None;
                 }
                 self.focus = Focus::Tree;
                 self.status = if was_streaming {
@@ -685,9 +750,100 @@ impl App {
                     self.status = "generating — Esc stops".into();
                 }
             }
+            // Phase 9 story operations — smallest first: continue →
+            // rewrite → summarize → outline → review.
+            KeyCode::Char('c') => self.start_op(core, &mut panel, OpKind::Continue),
+            KeyCode::Char('w') => self.start_op(core, &mut panel, OpKind::Rewrite),
+            KeyCode::Char('s') => self.start_op(core, &mut panel, OpKind::Summarize),
+            KeyCode::Char('o') => self.start_op(core, &mut panel, OpKind::Outline),
+            KeyCode::Char('r') => self.start_op(core, &mut panel, OpKind::Review),
             _ => {}
         }
         self.ai_panel = Some(panel);
+    }
+
+    /// Start a Phase 9 story operation as a job: preparation runs on the
+    /// main thread (deterministic — it resolves the exact target range and
+    /// prompt, no model involved), then the generation streams in the job
+    /// thread; the finished draft becomes a Core proposal. A review answers
+    /// as a report instead (§7.4).
+    fn start_op(&mut self, core: &mut Core, panel: &mut AiPanel, op: OpKind) {
+        if panel.job.is_some() {
+            panel.error = Some("still busy — Esc stops the current run".into());
+            return;
+        }
+        let Some(ai) = self.ai.clone() else {
+            panel.error = Some("no AI runtime installed — AI is optional".into());
+            return;
+        };
+        if !ai.is_loaded() {
+            panel.error = Some("load the model first (l)".into());
+            return;
+        }
+        let chapter_key = self
+            .open_rel
+            .as_ref()
+            .map(|rel| rel.to_string_lossy().into_owned());
+        let budget = oca_ai::DEFAULT_BUDGET;
+        let prepared = match (op, &chapter_key) {
+            (OpKind::Outline, _) => oca_ai::prepare_generate_outline(core, budget),
+            (OpKind::Continue, Some(chapter)) => {
+                let at = self.editor.cursor();
+                oca_ai::prepare_continue_scene(core, chapter, at, budget)
+            }
+            (OpKind::Rewrite, Some(chapter)) => match self.editor.selection() {
+                Some(range) if !range.is_empty() => oca_ai::prepare_rewrite_selection(
+                    core,
+                    chapter,
+                    range.start,
+                    range.end,
+                    None,
+                    budget,
+                ),
+                _ => Err(anyhow::anyhow!(
+                    "select the text to rewrite first (Shift+arrows)"
+                )),
+            },
+            (OpKind::Summarize, Some(chapter)) => {
+                oca_ai::prepare_summarize_chapter(core, chapter, budget)
+            }
+            (OpKind::Review, Some(chapter)) => {
+                oca_ai::prepare_review_chapter(core, chapter, budget)
+            }
+            (_, None) => Err(anyhow::anyhow!(
+                "open a chapter first — this operation works on the open document"
+            )),
+        };
+        match prepared {
+            Ok(prepared) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let slot = Arc::clone(&panel.op_slot);
+                *slot.lock().expect("op slot") = None;
+                let ai_job = ai.clone();
+                let name = op.name();
+                panel.job = Some(core.spawn_job(
+                    format!("generate ({name})"),
+                    Priority::Interactive,
+                    move |_ctx| {
+                        oca_ai::complete(&ai_job, prepared, &mut |token| {
+                            let _ = tx.send(token.to_string());
+                        })
+                        .map(|draft| {
+                            *slot.lock().expect("op slot") = Some(draft);
+                        })
+                    },
+                ));
+                panel.state = AiState::Streaming;
+                panel.op = Some(op);
+                panel.stream_tokens = 0;
+                panel.stream_text.clear();
+                panel.rx = Some(rx);
+                panel.error = None;
+                panel.report = None;
+                self.status = format!("generating ({name}) — Esc stops");
+            }
+            Err(e) => panel.error = Some(format!("{e:#}")),
+        }
     }
 
     /// Drain probe tokens and retire finished AI jobs (runs every tick).
@@ -715,6 +871,7 @@ impl App {
         panel.rx = None;
         match snapshot.state {
             JobState::Failed(msg) => {
+                panel.op = None;
                 panel.error = Some(msg);
                 // A failed probe leaves the model loaded; a failed load
                 // leaves it unloaded.
@@ -724,10 +881,246 @@ impl App {
                     AiState::Ready
                 };
             }
-            JobState::Cancelled | JobState::Done | JobState::Running => {
+            JobState::Cancelled => {
+                panel.op = None;
                 panel.state = AiState::Ready;
             }
+            JobState::Done => {
+                panel.state = AiState::Ready;
+                // A finished operation hands its draft to the main thread,
+                // which records it as a proposal (rule 4: never in place).
+                if panel.op.take().is_some()
+                    && let Some(draft) = panel.op_slot.lock().expect("op slot").take()
+                {
+                    if matches!(draft.target, oca_ai::DraftTarget::Report) {
+                        panel.report = Some(draft.payload);
+                        self.status =
+                            "review ready — shown in the panel; a report is never written".into();
+                    } else {
+                        match oca_ai::create_proposal(core, draft) {
+                            Ok(id) => {
+                                self.status = format!("proposal {id} recorded — p opens proposals");
+                            }
+                            Err(e) => {
+                                panel.error = Some(format!("proposal not recorded: {e:#}"));
+                            }
+                        }
+                    }
+                }
+            }
+            JobState::Running => {}
         }
+    }
+
+    // ---- AI proposals panel (Phase 9) --------------------------------------
+
+    fn open_proposal_panel(&mut self, core: &Core) {
+        let proposals = core.proposals().unwrap_or_default();
+        self.status = if proposals.is_empty() {
+            "AI proposals — none yet (run an operation from the AI panel: i)".into()
+        } else {
+            format!(
+                "AI proposals — {} total · Enter review, a accept, r reject, e edit",
+                proposals.len()
+            )
+        };
+        self.proposal_panel = Some(ProposalPanel {
+            proposals,
+            sel: 0,
+            mode: PropMode::List,
+        });
+        self.focus = Focus::Proposals;
+    }
+
+    /// Reload the list from Core after a decision (files are canonical).
+    fn refresh_proposals(core: &Core, panel: &mut ProposalPanel) {
+        panel.proposals = core.proposals().unwrap_or_default();
+        if panel.sel >= panel.proposals.len() {
+            panel.sel = panel.proposals.len().saturating_sub(1);
+        }
+        panel.mode = PropMode::List;
+    }
+
+    /// The review's two columns: what sits at the target range now, and
+    /// what the proposal would put there.
+    fn proposal_columns(core: &Core, p: &oca_core::Proposal) -> (String, String) {
+        let original = if p.target.start == p.target.end {
+            "(new text is added here — nothing is replaced)".to_string()
+        } else {
+            match core.read_document(&p.target.document) {
+                Ok(doc) => match doc.body().get(p.target.start..p.target.end) {
+                    Some(text) => text.to_string(),
+                    None => "(the original text moved — applying will re-check it)".to_string(),
+                },
+                Err(e) => format!("(cannot read {}: {e})", p.target.document.display()),
+            }
+        };
+        (original, p.payload.clone())
+    }
+
+    fn proposal_key(&mut self, core: &mut Core, key: KeyEvent) {
+        let Some(mut panel) = self.proposal_panel.take() else {
+            return;
+        };
+
+        // Payload editing (`e`): the embedded editor captures every key
+        // except the save (Ctrl-S → revise) and discard (Esc) ones.
+        if matches!(
+            panel.mode,
+            PropMode::Detail {
+                editing: Some(_),
+                ..
+            }
+        ) {
+            let is_save = key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'));
+            if is_save {
+                if let PropMode::Detail {
+                    editing, proposed, ..
+                } = &mut panel.mode
+                    && let Some(editor) = editing.take()
+                {
+                    let payload = editor.text();
+                    if let Some(p) = panel.proposals.get(panel.sel) {
+                        match core.execute(Command::ProposalRevise {
+                            id: p.id.clone(),
+                            payload: payload.clone(),
+                        }) {
+                            Ok(_) => {
+                                *proposed = payload;
+                                self.status =
+                                    format!("proposal {} revised — accept it when ready", p.id);
+                            }
+                            Err(e) => self.status = format!("not revised: {e}"),
+                        }
+                    }
+                }
+            } else if key.code == KeyCode::Esc {
+                if let PropMode::Detail { editing, .. } = &mut panel.mode {
+                    *editing = None;
+                }
+                self.status = "edit discarded — the proposal is unchanged".into();
+            } else if let PropMode::Detail {
+                editing: Some(editor),
+                ..
+            } = &mut panel.mode
+            {
+                editor.handle_key(key, 60, 16);
+            }
+            self.proposal_panel = Some(panel);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => match panel.mode {
+                PropMode::Detail { .. } => panel.mode = PropMode::List,
+                PropMode::List => {
+                    self.focus = Focus::Tree;
+                    self.status = "AI proposals closed".into();
+                    return;
+                }
+            },
+            KeyCode::Up => match &mut panel.mode {
+                PropMode::List => panel.sel = panel.sel.saturating_sub(1),
+                PropMode::Detail { scroll, .. } => *scroll = scroll.saturating_sub(1),
+            },
+            KeyCode::Down => match &mut panel.mode {
+                PropMode::List => {
+                    if panel.sel + 1 < panel.proposals.len() {
+                        panel.sel += 1;
+                    }
+                }
+                PropMode::Detail { scroll, .. } => *scroll += 1,
+            },
+            KeyCode::Enter => match &panel.mode {
+                PropMode::List => {
+                    if let Some(p) = panel.proposals.get(panel.sel) {
+                        let (original, proposed) = Self::proposal_columns(core, p);
+                        panel.mode = PropMode::Detail {
+                            original,
+                            proposed,
+                            scroll: 0,
+                            editing: None,
+                        };
+                    }
+                }
+                PropMode::Detail { .. } => panel.mode = PropMode::List,
+            },
+            KeyCode::Char('e') => {
+                // Edit the payload: open the review straight into edit mode.
+                if let Some(p) = panel.proposals.get(panel.sel).cloned()
+                    && p.status.is_undecided()
+                {
+                    let (original, proposed) = Self::proposal_columns(core, &p);
+                    let mut editor = Box::new(Editor::new());
+                    editor.load(&proposed);
+                    panel.mode = PropMode::Detail {
+                        original,
+                        proposed,
+                        scroll: 0,
+                        editing: Some(editor),
+                    };
+                    self.status = "editing the proposal — Ctrl-S saves it, Esc discards".into();
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('r') => {
+                let accept = key.code == KeyCode::Char('a');
+                let Some(p) = panel.proposals.get(panel.sel).cloned() else {
+                    self.proposal_panel = Some(panel);
+                    return;
+                };
+                if !p.status.is_undecided() {
+                    self.status = format!("proposal {} is already {}", p.id, p.status.as_str());
+                } else if accept {
+                    match core.execute(Command::ProposalApply { id: p.id.clone() }) {
+                        Ok(events) => {
+                            self.status = match events.first() {
+                                Some(Event::ProposalApplied { rebased: false, .. }) => {
+                                    format!(
+                                        "proposal {} applied — a snapshot was saved first \
+                                         (V to undo)",
+                                        p.id
+                                    )
+                                }
+                                Some(Event::ProposalApplied { rebased: true, .. }) => {
+                                    format!(
+                                        "proposal {} applied at its new position — a \
+                                         snapshot was saved first",
+                                        p.id
+                                    )
+                                }
+                                Some(Event::ProposalStale { .. }) => {
+                                    format!(
+                                        "proposal {} went stale — your edits won; nothing \
+                                         was changed",
+                                        p.id
+                                    )
+                                }
+                                _ => format!("proposal {} applied", p.id),
+                            };
+                            Self::refresh_proposals(core, &mut panel);
+                        }
+                        Err(e) => self.status = format!("not applied: {e}"),
+                    }
+                } else {
+                    match core.execute(Command::ProposalReject { id: p.id.clone() }) {
+                        Ok(_) => {
+                            self.status = format!("proposal {} rejected — kept for audit", p.id);
+                            Self::refresh_proposals(core, &mut panel);
+                        }
+                        Err(e) => self.status = format!("not rejected: {e}"),
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // An emptied list closes the panel — nothing left to decide.
+        if panel.proposals.is_empty() && matches!(panel.mode, PropMode::List) {
+            self.focus = Focus::Tree;
+            return;
+        }
+        self.proposal_panel = Some(panel);
     }
 
     pub fn tick(&mut self, core: &mut Core) -> Result<()> {
@@ -1499,6 +1892,22 @@ impl App {
     pub fn on_key(&mut self, core: &mut Core, key: KeyEvent) -> Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // Ctrl-S inside the proposal payload editor revises the proposal —
+        // it must beat the global document save while editing.
+        if ctrl
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+            && matches!(
+                self.proposal_panel.as_ref().map(|p| &p.mode),
+                Some(PropMode::Detail {
+                    editing: Some(_),
+                    ..
+                })
+            )
+        {
+            self.proposal_key(core, key);
+            return Ok(());
+        }
+
         // Global keys.
         if ctrl {
             match key.code {
@@ -1566,6 +1975,7 @@ impl App {
             Focus::Search => self.search_key(core, key),
             Focus::Snapshots => self.snap_key(core, key),
             Focus::Ai => self.ai_key(core, key),
+            Focus::Proposals => self.proposal_key(core, key),
         }
         Ok(())
     }
@@ -1622,6 +2032,7 @@ impl App {
             KeyCode::Char('a') | KeyCode::Char('A') => self.open_audio_panel(core),
             KeyCode::Char('v') | KeyCode::Char('V') => self.open_snap_panel(core),
             KeyCode::Char('i') | KeyCode::Char('I') => self.open_ai_panel(),
+            KeyCode::Char('p') | KeyCode::Char('P') => self.open_proposal_panel(core),
             KeyCode::Tab if self.open_rel.is_some() => {
                 self.focus = Focus::Editor;
             }
@@ -1720,6 +2131,7 @@ impl App {
         self.draw_search(frame);
         self.draw_snapshots(frame);
         self.draw_ai(frame);
+        self.draw_proposals(frame);
     }
 
     fn draw_tree(&self, frame: &mut Frame, area: Rect) {
@@ -1916,6 +2328,12 @@ impl App {
                     let budget = 64usize; // probe request's max_tokens
                     let filled = (panel.stream_tokens * 20 / budget).min(20);
                     lines.push(Line::from(""));
+                    if let Some(op) = panel.op {
+                        lines.push(Line::styled(
+                            format!("Operation: {}", op.name()),
+                            Style::new().fg(Color::Cyan),
+                        ));
+                    }
                     lines.push(Line::styled("Generating…", Style::new().fg(Color::Yellow)));
                     lines.push(Line::styled(
                         format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled)),
@@ -1934,6 +2352,19 @@ impl App {
                         shown.push('…');
                     }
                     lines.push(Line::styled(shown, Style::new().fg(Color::DarkGray)));
+                }
+                if let Some(report) = &panel.report {
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled(
+                        "Review report (never written):",
+                        Style::new().fg(Color::Cyan),
+                    ));
+                    for l in report.lines().take(12) {
+                        lines.push(Line::from(l.to_string()));
+                    }
+                    if report.lines().count() > 12 {
+                        lines.push(Line::from("…"));
+                    }
                 }
                 if let Some(error) = &panel.error {
                     lines.push(Line::from(""));
@@ -1978,10 +2409,116 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "l load · u unload · t probe · Esc close",
+            "l load · u unload · t probe · c continue · w rewrite · s summarize · \
+             o outline · r review · Esc close",
             Style::new().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    /// The AI proposals panel (Phase 9): the list, or the side-by-side
+    /// review with the optional payload editor.
+    fn draw_proposals(&mut self, frame: &mut Frame) {
+        let Some(panel) = &mut self.proposal_panel else {
+            return;
+        };
+        match &mut panel.mode {
+            PropMode::List => {
+                let area = centered(frame.area(), 82, 16);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" AI Proposals ");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                if panel.proposals.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new("No proposals — run an operation from the AI panel (i)."),
+                        inner,
+                    );
+                    return;
+                }
+                let items: Vec<Line> = panel
+                    .proposals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let marker = if i == panel.sel { "▶ " } else { "  " };
+                        let color = match p.status {
+                            oca_core::ProposalStatus::Pending => Color::Yellow,
+                            oca_core::ProposalStatus::Edited => Color::Cyan,
+                            oca_core::ProposalStatus::Accepted => Color::Green,
+                            _ => Color::DarkGray,
+                        };
+                        Line::styled(
+                            format!(
+                                "{marker}{}  {:<9} {:<18} {}",
+                                p.id,
+                                p.status.as_str(),
+                                p.operation,
+                                p.target.document.display()
+                            ),
+                            Style::new().fg(color),
+                        )
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(items), inner);
+            }
+            PropMode::Detail {
+                original,
+                proposed,
+                scroll,
+                editing,
+            } => {
+                let area = centered(frame.area(), 100, 26);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Review — a accept · r reject · e edit · Enter back · Esc close ");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(inner);
+
+                let left_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Current Draft ");
+                let left_area = left_block.inner(cols[0]);
+                frame.render_widget(left_block, cols[0]);
+                frame.render_widget(
+                    Paragraph::new(original.clone())
+                        .wrap(Wrap { trim: false })
+                        .scroll((*scroll, 0)),
+                    left_area,
+                );
+
+                match editing {
+                    // Payload editing: the rope editor takes over the right
+                    // pane (rule 8 — it's the same editor widget, no logic).
+                    Some(editor) => {
+                        let right_block = Block::default()
+                            .borders(Borders::ALL)
+                            .title(" AI Proposed Revision (editing — Ctrl-S saves) ");
+                        let right_area = right_block.inner(cols[1]);
+                        frame.render_widget(right_block, cols[1]);
+                        editor.render(right_area, frame.buffer_mut(), true);
+                    }
+                    None => {
+                        let right_block = Block::default()
+                            .borders(Borders::ALL)
+                            .title(" AI Proposed Revision ");
+                        let right_area = right_block.inner(cols[1]);
+                        frame.render_widget(right_block, cols[1]);
+                        frame.render_widget(
+                            Paragraph::new(proposed.clone())
+                                .wrap(Wrap { trim: false })
+                                .scroll((*scroll, 0)),
+                            right_area,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn draw_form(&self, frame: &mut Frame) {
@@ -2220,7 +2757,12 @@ impl App {
             }
             Focus::Search => " type filter · ↑↓ select · Enter open · Esc close",
             Focus::Snapshots => " ↑↓ select · c save now · Enter diff · r restore · Esc close",
-            Focus::Ai => " l load · u unload · t probe · Esc close",
+            Focus::Ai => {
+                " l load · u unload · t probe · c continue · w rewrite · s summarize · o outline · r review · Esc close"
+            }
+            Focus::Proposals => {
+                " ↑↓ select · Enter review · a accept · r reject · e edit · Esc close"
+            }
         };
         let line2 = Line::from(Span::styled(hints, Style::new().fg(Color::DarkGray)));
         frame.render_widget(Paragraph::new(vec![line1, line2]), area);
@@ -3620,5 +4162,387 @@ hold on to the light
         assert!(text.contains("no AI runtime"), "empty state renders");
         assert!(text.contains("optional"), "rule 3 messaging renders");
         assert!(text.contains("oca runtime install"), "hint renders");
+    }
+
+    // ---- AI proposals + story operations (Phase 9) ---------------------------
+
+    /// An AI facade over the scripted story mock, already loaded — the
+    /// canned answers each operation's contract (rule 6, no real model).
+    fn story_ai() -> Ai {
+        let ai = Ai::new(Arc::new(oca_ai::MockModel::story_defaults()), Vec::new());
+        ai.load().unwrap();
+        ai
+    }
+
+    fn body_of(core: &Core, rel: &Path) -> String {
+        core.read_document(rel).unwrap().body().to_string()
+    }
+
+    /// Record a pending proposal the way an operation would (rule 4: the
+    /// author's document is never touched).
+    fn seed_proposal(core: &mut Core, rel: &Path, from: &str, to: &str) -> String {
+        let body = body_of(core, rel);
+        let start = body.find(from).expect("anchor in body");
+        let end = start + from.len();
+        let events = core
+            .execute(Command::ProposalCreate {
+                operation: "rewrite_selection".into(),
+                prompt_version: "rewrite-selection/1".into(),
+                model: "mock".into(),
+                document: rel.to_path_buf(),
+                start,
+                end,
+                payload: to.into(),
+                context_manifest: Vec::new(),
+            })
+            .unwrap();
+        let Event::ProposalCreated { id, .. } = &events[0] else {
+            panic!("expected ProposalCreated: {events:?}");
+        };
+        id.clone()
+    }
+
+    #[test]
+    fn p_opens_proposals_panel_and_lists_pending() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let id = seed_proposal(&mut core, &rel, "two", "too");
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        assert_eq!(app.focus, Focus::Proposals);
+        let panel = app.proposal_panel.as_ref().expect("panel open");
+        assert_eq!(panel.proposals.len(), 1);
+        assert_eq!(panel.proposals[0].id, id);
+
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.proposal_panel.is_none());
+    }
+
+    #[test]
+    fn accept_applies_through_core_and_undo_restores() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        seed_proposal(&mut core, &rel, "two", "too");
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        assert!(app.status.contains("applied"), "{}", app.status);
+        assert!(app.status.contains("snapshot"), "{}", app.status);
+        assert_eq!(body_of(&core, &rel), "one too three\n");
+
+        // The accept is undoable: the auto-snapshot restores the original.
+        core.execute(Command::SnapshotRestore { n: 1 }).unwrap();
+        assert_eq!(body_of(&core, &rel), "one two three\n");
+    }
+
+    #[test]
+    fn accept_goes_stale_rather_than_clobbering_edits() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let id = seed_proposal(&mut core, &rel, "two", "too");
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        // The author rewrites the very sentence the proposal targets.
+        core.save_body(&rel, "one twice is plenty\n").unwrap();
+
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        assert!(app.status.contains("stale"), "{}", app.status);
+        assert_eq!(body_of(&core, &rel), "one twice is plenty\n");
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            oca_core::ProposalStatus::Stale
+        );
+    }
+
+    #[test]
+    fn edit_revises_the_payload_then_accept_uses_it() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let id = seed_proposal(&mut core, &rel, "two", "too");
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        // Enter the side-by-side review, then start editing the payload.
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('e'))).unwrap();
+        assert!(
+            matches!(
+                &app.proposal_panel.as_ref().unwrap().mode,
+                PropMode::Detail {
+                    editing: Some(_),
+                    ..
+                }
+            ),
+            "edit mode is active"
+        );
+
+        // Replace the whole payload with the author's own text: select it
+        // all, type over it, then Ctrl-S to save the revision.
+        {
+            let panel = app.proposal_panel.as_mut().unwrap();
+            let PropMode::Detail {
+                editing: Some(editor),
+                ..
+            } = &mut panel.mode
+            else {
+                panic!("editing");
+            };
+            editor.select_all();
+        }
+        app.on_key(&mut core, key(KeyCode::Char('2'))).unwrap();
+        app.on_key(&mut core, ctrl('s')).unwrap();
+
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().payload,
+            "2",
+            "the revision reached Core"
+        );
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            oca_core::ProposalStatus::Edited
+        );
+        assert!(app.status.contains("revised"), "{}", app.status);
+
+        // Accepting applies the revised payload, not the model's text.
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        assert_eq!(body_of(&core, &rel), "one 2 three\n");
+    }
+
+    #[test]
+    fn reject_keeps_the_document_and_the_audit_trail() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let id = seed_proposal(&mut core, &rel, "two", "too");
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        assert!(app.status.contains("rejected"), "{}", app.status);
+        assert_eq!(body_of(&core, &rel), "one two three\n");
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            oca_core::ProposalStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn continue_and_summarize_operations_record_proposals() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(story_ai());
+        app.open_doc(&mut core, rel.clone());
+        app.editor.goto_char(8);
+        app.on_key(&mut core, key(KeyCode::Tab)).unwrap(); // back to the tree
+
+        // Continue from the cursor: an insertion proposal at byte 8.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        assert_eq!(app.ai_panel.as_ref().unwrap().state, AiState::Streaming);
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        {
+            let proposals = core.proposals().unwrap();
+            assert_eq!(proposals.len(), 1);
+            let p = &proposals[0];
+            assert_eq!(p.operation, "continue_scene");
+            assert_eq!(p.target.document, rel);
+            assert_eq!(p.target.start, 8);
+            assert_eq!(p.target.end, 8, "insertion, nothing replaced");
+            assert!(p.payload.contains("storm broke"), "{}", p.payload);
+        }
+        // Rule 4: the document itself is untouched until the author accepts.
+        assert_eq!(body_of(&core, &rel), "one two three\n");
+
+        // Summarize appends to the notes file as a proposal.
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        {
+            let proposals = core.proposals().unwrap();
+            assert_eq!(proposals.len(), 2);
+            assert_eq!(proposals[1].operation, "summarize_chapter");
+            assert_eq!(
+                proposals[1].target.document,
+                PathBuf::from("notes/summaries.md")
+            );
+            assert!(
+                proposals[1].payload.starts_with("## First"),
+                "{}",
+                proposals[1].payload
+            );
+        }
+        // The container may exist empty, but no AI text landed before the
+        // author accepts (rule 4).
+        let notes = core
+            .read_document(Path::new("notes/summaries.md"))
+            .map(|d| d.body().to_string())
+            .unwrap_or_default();
+        assert!(!notes.contains("Elena receives"), "{notes}");
+    }
+
+    #[test]
+    fn rewrite_uses_the_editor_selection_and_review_is_report_only() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(story_ai());
+        app.open_doc(&mut core, rel.clone());
+
+        // Select the first 7 bytes in the editor (Shift+Right from Home),
+        // then run rewrite — the proposal must target exactly that range.
+        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        app.focus = Focus::Editor;
+        app.on_key(&mut core, key(KeyCode::Home)).unwrap();
+        for _ in 0..7 {
+            app.on_key(&mut core, shift_right).unwrap();
+        }
+        assert_eq!(
+            app.editor.selection().map(|r| (r.start, r.end)),
+            Some((0, 7)),
+            "shift-select works in the editor"
+        );
+        app.on_key(&mut core, key(KeyCode::Tab)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('w'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        {
+            let proposals = core.proposals().unwrap();
+            assert_eq!(proposals.len(), 1);
+            assert_eq!(proposals[0].operation, "rewrite_selection");
+            assert_eq!((proposals[0].target.start, proposals[0].target.end), (0, 7));
+        }
+        assert_eq!(body_of(&core, &rel), "one two three\n", "untouched");
+
+        // Review streams a report into the panel and records nothing.
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        settle(&mut app, &mut core, |p| p.report.is_some());
+        let panel = app.ai_panel.as_ref().unwrap();
+        let report = panel.report.as_deref().unwrap();
+        assert!(report.contains("warning"), "{report}");
+        assert!(report.contains("paragraph 2"), "{report}");
+        assert_eq!(
+            core.proposals().unwrap().len(),
+            1,
+            "review is not a proposal"
+        );
+    }
+
+    #[test]
+    fn outline_operation_targets_the_outline_file() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(story_ai());
+        app.open_doc(&mut core, rel.clone());
+        app.on_key(&mut core, key(KeyCode::Tab)).unwrap(); // back to the tree
+
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('o'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+
+        let proposals = core.proposals().unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].operation, "generate_outline");
+        assert_eq!(
+            proposals[0].target.document,
+            PathBuf::from("outline/outline.md")
+        );
+        assert!(
+            proposals[0].payload.contains("Act I"),
+            "{}",
+            proposals[0].payload
+        );
+    }
+
+    #[test]
+    fn operations_explain_themselves_without_a_model_or_chapter() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        // No runtime at all: the operation says so, touches nothing.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        let panel = app.ai_panel.as_ref().unwrap();
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no AI runtime")),
+            "{:?}",
+            panel.error
+        );
+        assert!(core.proposals().unwrap().is_empty());
+
+        // A runtime, but no chapter open: same — an explanation, no write.
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.attach_ai(story_ai());
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('s'))).unwrap();
+        let panel = app.ai_panel.as_ref().unwrap();
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("open a chapter")),
+            "{:?}",
+            panel.error
+        );
+        assert_eq!(body_of(&core, &rel), "one two three\n");
+        assert!(core.proposals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn proposals_panel_draws_list_and_side_by_side_review() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(&rel, "one two three\n").unwrap();
+        seed_proposal(&mut core, &rel, "two", "too");
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw(&core, frame))
+            .expect("list renders");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("AI Proposals"), "{text}");
+        assert!(text.contains("pending"), "{text}");
+        assert!(text.contains("rewrite_selection"), "{text}");
+
+        // Enter the review: both columns render side by side.
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        terminal
+            .draw(|frame| app.draw(&core, frame))
+            .expect("review renders");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Current Draft"), "{text}");
+        assert!(text.contains("AI Proposed Revision"), "{text}");
+        assert!(text.contains("too"), "payload column shows the revision");
     }
 }

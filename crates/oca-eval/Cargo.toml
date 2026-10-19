@@ -1,0 +1,23 @@
+[package]
+name = "oca-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCA AI evals: seeded fixtures + deterministic graders (no LLM-as-judge in CI)"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+oca-ai.workspace = true
+oca-core.workspace = true
+oca-model.workspace = true
+oca-story.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

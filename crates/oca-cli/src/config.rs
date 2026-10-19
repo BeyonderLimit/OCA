@@ -52,6 +52,10 @@ pub struct AiFileConfig {
     /// Replace the standard whisper arguments entirely — for test doubles
     /// and nonstandard runtimes, mirroring `llama_server`'s behavior.
     pub whisper_args: Option<Vec<String>>,
+    /// Use the built-in scripted model instead of a real runtime — for
+    /// trying the AI features offline, and for tests (deterministic canned
+    /// answers; needs no runtime, no model files).
+    pub mock: Option<bool>,
 }
 
 /// Fully merged configuration plus which layer files were read (for `doctor`).
@@ -102,6 +106,7 @@ impl Config {
             cfg.ai.whisper_models_dir = ai.whisper_models_dir.or(cfg.ai.whisper_models_dir);
             cfg.ai.whisper_language = ai.whisper_language.or(cfg.ai.whisper_language);
             cfg.ai.whisper_args = ai.whisper_args.or(cfg.ai.whisper_args);
+            cfg.ai.mock = ai.mock.or(cfg.ai.mock);
             cfg.sources.push(path.to_path_buf());
         }
         Ok(cfg)
@@ -120,6 +125,7 @@ impl Config {
             whisper_models_dir: self.ai.whisper_models_dir.clone(),
             whisper_language: self.ai.whisper_language.clone(),
             whisper_args: self.ai.whisper_args.clone(),
+            mock: self.ai.mock.unwrap_or(false),
         }
     }
 

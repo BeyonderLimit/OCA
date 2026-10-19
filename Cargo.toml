@@ -11,6 +11,7 @@ members = [
     "crates/oca-tui",
     "crates/oca-versioning",
     "crates/oca-ai",
+    "crates/oca-eval",
 ]
 resolver = "2"
 
@@ -40,6 +41,7 @@ libc = "0.2"
 oca-audio = { path = "crates/oca-audio" }
 oca-ai = { path = "crates/oca-ai" }
 oca-core = { path = "crates/oca-core" }
+oca-eval = { path = "crates/oca-eval" }
 oca-markdown = { path = "crates/oca-markdown" }
 oca-model = { path = "crates/oca-model" }
 oca-storage = { path = "crates/oca-storage" }

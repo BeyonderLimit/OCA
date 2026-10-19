@@ -60,6 +60,19 @@ pub enum Command {
         cmd: StoryCommand,
     },
 
+    /// Story AI operations (Phase 9): each records an AI proposal —
+    /// nothing is written until you accept it with `oca proposal apply`.
+    Ai {
+        #[command(subcommand)]
+        cmd: AiCommand,
+    },
+
+    /// Review and decide AI proposals: list, inspect, apply, reject.
+    Proposal {
+        #[command(subcommand)]
+        cmd: ProposalCommand,
+    },
+
     /// Song tools: offline lyric analysis (Phase 3 — no AI involved).
     Song {
         #[command(subcommand)]
@@ -224,6 +237,108 @@ pub enum SnapshotCommand {
     Restore {
         /// Snapshot number to restore.
         n: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AiCommand {
+    /// Continue a scene: generate the next passage after a position in the
+    /// chapter (a proposal — nothing is written until you accept it).
+    Continue {
+        /// Chapter id (`ch_…`), title, or path.
+        chapter: String,
+        /// Byte position in the chapter body to continue from (default: the
+        /// end of the body — i.e. continue the last scene).
+        #[arg(long)]
+        at: Option<usize>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Rewrite a byte range of a chapter (a proposal — nothing is written
+    /// until you accept it).
+    Rewrite {
+        /// Chapter id (`ch_…`), title, or path.
+        chapter: String,
+        /// Start byte of the selection in the chapter body.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in the chapter body.
+        #[arg(long)]
+        end: usize,
+        /// Style guidance ("tighter", "from Marcus's POV", …).
+        #[arg(long)]
+        guidance: Option<String>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Summarize a chapter into notes/summaries.md (a proposal).
+    Summarize {
+        /// Chapter id (`ch_…`), title, or path.
+        chapter: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Generate an outline of the whole manuscript into outline/outline.md
+    /// (a proposal).
+    Outline {
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Review a chapter for continuity and craft problems. This is a
+    /// report: it is printed for you to read and never written anywhere.
+    Review {
+        /// Chapter id (`ch_…`), title, or path.
+        chapter: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProposalCommand {
+    /// List every proposal with its status and target.
+    List {
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Show a proposal in full: operation, target range, payload, and the
+    /// context manifest that produced it.
+    Show {
+        /// Proposal id (`prop_…`).
+        id: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Accept a proposal. The current state is snapshotted first; undo with
+    /// `oca snapshot restore`. Goes stale rather than overwriting edits.
+    Apply {
+        /// Proposal id (`prop_…`).
+        id: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Reject a proposal (kept for audit, never applied).
+    Reject {
+        /// Proposal id (`prop_…`).
+        id: String,
         /// Project directory (default: the project in the cwd).
         #[arg(long)]
         project: Option<PathBuf>,

@@ -95,7 +95,7 @@ pub struct ChapterRef {
 }
 
 impl ChapterRef {
-    fn heading(&self) -> String {
+    pub fn heading(&self) -> String {
         format!("Chapter {} — {} ({})", self.seq, self.title, self.id)
     }
 }

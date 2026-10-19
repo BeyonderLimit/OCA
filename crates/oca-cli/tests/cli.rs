@@ -1110,6 +1110,128 @@ fn write_ai_config(home: &Path, body: &str) {
     std::fs::write(home.join(".oca").join("config.toml"), body).unwrap();
 }
 
+/// Phase 9 exit, CLI half: with the built-in scripted model (`mock = true`
+/// in `[ai]`, which needs no runtime and no model files), an operation
+/// records a proposal without touching the manuscript; accepting it is
+/// snapshotted first and undoes cleanly via `oca snapshot restore`.
+#[test]
+fn phase9_exit_ai_operation_proposal_apply_then_undo() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    write_ai_config(&home, "[ai]\nmock = true\n");
+
+    let chapter = root.join("manuscript/002-the-letter.md");
+    let before = std::fs::read_to_string(&chapter).unwrap();
+
+    // The operation records a proposal and writes nothing on its own.
+    let recorded = run_in(&home, tmp.path(), &root, &["ai", "summarize", "The Letter"]);
+    let stdout = stdout_of(&recorded);
+    assert!(stdout.contains("proposal prop_"), "got: {stdout}");
+    let id: String = stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("prop_"))
+        .unwrap()
+        .to_string();
+
+    // The chapter is untouched, and whatever container exists holds no AI
+    // text — the payload only lands when the proposal is accepted.
+    assert_eq!(std::fs::read_to_string(&chapter).unwrap(), before);
+    if let Ok(notes) = std::fs::read_to_string(root.join("notes/summaries.md")) {
+        assert!(
+            !notes.contains("Elena receives"),
+            "a pending proposal must not write AI text: {notes}"
+        );
+    }
+
+    // Accept it: a snapshot is saved first, then notes/summaries.md appears.
+    let applied = run_in(&home, tmp.path(), &root, &["proposal", "apply", &id]);
+    let applied = stdout_of(&applied);
+    assert!(applied.contains("applied"), "got: {applied}");
+    let notes = std::fs::read_to_string(root.join("notes/summaries.md")).unwrap();
+    assert!(notes.contains("## The Letter"), "got: {notes}");
+
+    // Undo: the snapshot taken before the apply restores the exact prior
+    // state — the summary text is gone (the container was already empty).
+    let restored = run_in(&home, tmp.path(), &root, &["snapshot", "restore", "1"]);
+    stdout_of(&restored);
+    let notes_after = std::fs::read_to_string(root.join("notes/summaries.md")).unwrap_or_default();
+    assert!(
+        !notes_after.contains("Elena receives"),
+        "restore removes the applied summary: {notes_after}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&chapter).unwrap(),
+        before,
+        "the chapter is byte-identical after undo"
+    );
+
+    // A spent proposal is never re-applied.
+    let again = run(
+        &home,
+        tmp.path(),
+        &[
+            "proposal",
+            "apply",
+            &id,
+            "--project",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !again.status.success(),
+        "an accepted proposal must not apply twice"
+    );
+}
+
+/// `oca ai review` is a report, not a write: it prints structured issues and
+/// leaves every file alone.
+#[test]
+fn phase9_review_is_report_only() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    write_ai_config(&home, "[ai]\nmock = true\n");
+
+    let out = run_in(&home, tmp.path(), &root, &["ai", "review", "The Letter"]);
+    let stdout = stdout_of(&out);
+    // The scripted model answers the review operation with a timeline issue.
+    assert!(
+        stdout.contains("timeline") || stdout.contains("warning"),
+        "got: {stdout}"
+    );
+    let list = stdout_of(&run_in(&home, tmp.path(), &root, &["proposal", "list"]));
+    assert!(
+        !list.contains("review"),
+        "a review never becomes a proposal: {list}"
+    );
+}
+
+/// With no runtime and no model files, the AI operations fail with an
+/// actionable message and still touch nothing (rule 3: AI is optional).
+#[test]
+fn phase9_ai_operation_without_model_is_actionable_and_touches_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+
+    let chapter = root.join("manuscript/002-the-letter.md");
+    let before = std::fs::read_to_string(&chapter).unwrap();
+
+    let out = run_in(&home, tmp.path(), &root, &["ai", "summarize", "The Letter"]);
+    assert!(!out.status.success(), "no model, no operation");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mock = true") || stderr.contains("runtime install"),
+        "the error should say how to proceed: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&chapter).unwrap(), before);
+    assert!(!root.join("notes/summaries.md").exists());
+}
+
 /// True when any chapter file under `manuscript/` contains the text.
 fn manuscript_contains(root: &Path, needle: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(root.join("manuscript")) else {

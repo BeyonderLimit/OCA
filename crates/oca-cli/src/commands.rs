@@ -11,8 +11,8 @@ use oca_music::CheckReport;
 use oca_storage::registry::Registry;
 
 use crate::cli::{
-    AudioCommand, ChapterCommand, Command, RuntimeCommand, SnapshotCommand, SongCommand,
-    StoryCommand, TagCommand,
+    AiCommand, AudioCommand, ChapterCommand, Command, ProposalCommand, RuntimeCommand,
+    SnapshotCommand, SongCommand, StoryCommand, TagCommand,
 };
 use crate::config::Config;
 
@@ -23,6 +23,8 @@ pub fn dispatch(cmd: Command, home: Option<&Path>, cfg: &Config) -> Result<u8> {
         Command::Open { project } => open_tui(project.as_deref(), cfg),
         Command::Chapter { cmd } => chapter(cmd),
         Command::Story { cmd } => story(cmd),
+        Command::Ai { cmd } => ai(cmd, cfg),
+        Command::Proposal { cmd } => proposal(cmd),
         Command::Song { cmd } => song(cmd),
         Command::Audio { cmd } => audio(cmd),
         Command::Reindex { full, project } => reindex(full, project.as_deref()),
@@ -529,6 +531,173 @@ fn story(cmd: StoryCommand) -> Result<u8> {
 fn story_core(project: Option<&Path>) -> Result<Core> {
     let root = find_project(project)?;
     open_core(&root)
+}
+
+// ---- ai (Phase 9) -----------------------------------------------------------
+
+fn ai_project(cmd: &AiCommand) -> Option<PathBuf> {
+    match cmd {
+        AiCommand::Continue { project, .. }
+        | AiCommand::Rewrite { project, .. }
+        | AiCommand::Summarize { project, .. }
+        | AiCommand::Outline { project }
+        | AiCommand::Review { project, .. } => project.clone(),
+    }
+}
+
+/// Phase 9 story operations. Deterministic preparation resolves the target
+/// range and prompt; the model only ever fills in text; the result lands as
+/// a Core proposal (rule 4) that the author accepts or rejects.
+fn ai(cmd: AiCommand, cfg: &Config) -> Result<u8> {
+    let root = find_project(ai_project(&cmd).as_deref())?;
+    let mut core = open_core(&root)?;
+
+    let opts = cfg.bootstrap_options();
+    let facade = oca_ai::bootstrap(&opts)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no language model is available — install one with `oca runtime install`, \
+             or set `mock = true` in the [ai] config section to try the built-in \
+             scripted model"
+        )
+    })?;
+    facade.load()?;
+    let budget = opts
+        .context
+        .map(|c| c as usize)
+        .unwrap_or(oca_ai::DEFAULT_BUDGET);
+
+    let prepared = match cmd {
+        AiCommand::Continue {
+            chapter,
+            at,
+            project: _,
+        } => {
+            // Default: the end of the body — continue the last scene.
+            let at = match at {
+                Some(at) => at,
+                None => {
+                    let rel = oca_story::Story::new(&core).chapter(&chapter)?.rel;
+                    core.read_document(&rel)?.body().len()
+                }
+            };
+            oca_ai::prepare_continue_scene(&core, &chapter, at, budget)?
+        }
+        AiCommand::Rewrite {
+            chapter,
+            start,
+            end,
+            guidance,
+            project: _,
+        } => oca_ai::prepare_rewrite_selection(
+            &core,
+            &chapter,
+            start,
+            end,
+            guidance.as_deref(),
+            budget,
+        )?,
+        AiCommand::Summarize {
+            chapter,
+            project: _,
+        } => oca_ai::prepare_summarize_chapter(&core, &chapter, budget)?,
+        AiCommand::Outline { project: _ } => oca_ai::prepare_generate_outline(&core, budget)?,
+        AiCommand::Review {
+            chapter,
+            project: _,
+        } => oca_ai::prepare_review_chapter(&core, &chapter, budget)?,
+    };
+
+    let draft = oca_ai::complete(&facade, prepared, &mut |_| {})?;
+    let _ = facade.unload();
+
+    match draft.target {
+        // The review is a report the author reads; it is never written.
+        oca_ai::DraftTarget::Report => {
+            println!("{}", draft.payload);
+            Ok(0)
+        }
+        _ => {
+            let id = oca_ai::create_proposal(&mut core, draft)?;
+            println!("proposal {id} recorded — accept with `oca proposal apply {id}`");
+            Ok(0)
+        }
+    }
+}
+
+/// Open the project for a proposal decision (mutates Core state).
+fn proposal_core(project: Option<&Path>) -> Result<Core> {
+    let root = find_project(project)?;
+    open_core(&root)
+}
+
+fn proposal(cmd: ProposalCommand) -> Result<u8> {
+    match cmd {
+        ProposalCommand::List { project } => {
+            let core = proposal_core(project.as_deref())?;
+            for p in core.proposals()? {
+                println!(
+                    "{}  {:<9} {:<18} {}",
+                    p.id,
+                    p.status.as_str(),
+                    p.operation,
+                    p.target.document.display()
+                );
+            }
+            Ok(0)
+        }
+        ProposalCommand::Show { id, project } => {
+            let core = proposal_core(project.as_deref())?;
+            let p = core
+                .proposal(&id)?
+                .with_context(|| format!("no proposal {id}"))?;
+            println!("operation:  {}", p.operation);
+            println!("prompt:     {}", p.prompt_version);
+            println!("model:      {}", p.model);
+            println!("created:    {}", p.created);
+            println!("status:     {}", p.status.as_str());
+            println!(
+                "target:     {} (bytes {}..{})",
+                p.target.document.display(),
+                p.target.start,
+                p.target.end
+            );
+            println!("provenance: {} context entries", p.context_manifest.len());
+            println!("\n{}", p.payload);
+            Ok(0)
+        }
+        ProposalCommand::Apply { id, project } => {
+            let mut core = proposal_core(project.as_deref())?;
+            let events = core.execute(CoreCommand::ProposalApply { id })?;
+            match &events[0] {
+                Event::ProposalApplied { rebased: false, .. } => {
+                    println!(
+                        "applied — a snapshot was saved first \
+                         (undo with `oca snapshot restore`)"
+                    );
+                }
+                Event::ProposalApplied { rebased: true, .. } => {
+                    println!(
+                        "applied — the passage had moved, so the text was rebased onto it; \
+                         a snapshot was saved first (undo with `oca snapshot restore`)"
+                    );
+                }
+                Event::ProposalStale { .. } => {
+                    println!(
+                        "stale — the passage changed while the model was thinking; \
+                         your text was left untouched"
+                    );
+                }
+                other => bail!("unexpected outcome: {other:?}"),
+            }
+            Ok(0)
+        }
+        ProposalCommand::Reject { id, project } => {
+            let mut core = proposal_core(project.as_deref())?;
+            core.execute(CoreCommand::ProposalReject { id })?;
+            println!("rejected — kept for audit, never applied");
+            Ok(0)
+        }
+    }
 }
 
 // ---- song (Phase 3) ---------------------------------------------------------

@@ -108,6 +108,13 @@ pub enum Command {
     ProposalReject {
         id: String,
     },
+    /// Edit a proposal's payload before accepting it (A5 `edited`
+    /// status). The target and checksum stay pinned — editing text can
+    /// never move the goalposts on the author's edits.
+    ProposalRevise {
+        id: String,
+        payload: String,
+    },
 }
 
 /// Everything observable that happened. Frontends render these; tests assert
@@ -160,6 +167,10 @@ pub enum Event {
         rebased: bool,
     },
     ProposalRejected {
+        id: String,
+    },
+    /// The author edited a proposal's payload (status becomes `edited`).
+    ProposalRevised {
         id: String,
     },
     /// The target changed in a way that leaves no safe place to apply —
@@ -391,9 +402,9 @@ impl Core {
             Command::ProposalApply { id } => {
                 let root = self.snapshot_root("apply AI proposals")?;
                 let mut p = proposal::load(&root, &id)?;
-                if p.status != proposal::ProposalStatus::Pending {
+                if !p.status.is_undecided() {
                     anyhow::bail!(
-                        "proposal {id} is {} — only pending proposals apply",
+                        "proposal {id} is {} — only undecided proposals (pending or edited) apply",
                         p.status.as_str()
                     );
                 }
@@ -446,15 +457,30 @@ impl Core {
             Command::ProposalReject { id } => {
                 let root = self.snapshot_root("reject AI proposals")?;
                 let mut p = proposal::load(&root, &id)?;
-                if p.status != proposal::ProposalStatus::Pending {
+                if !p.status.is_undecided() {
                     anyhow::bail!(
-                        "proposal {id} is {} — only pending proposals can be rejected",
+                        "proposal {id} is {} — only undecided proposals (pending or edited) can be rejected",
                         p.status.as_str()
                     );
                 }
                 p.status = proposal::ProposalStatus::Rejected;
                 proposal::save(&root, &p)?;
                 vec![Event::ProposalRejected { id }]
+            }
+            Command::ProposalRevise { id, payload } => {
+                let root = self.snapshot_root("revise AI proposals")?;
+                let mut p = proposal::load(&root, &id)?;
+                if !p.status.is_undecided() {
+                    anyhow::bail!(
+                        "proposal {id} is {} — only undecided proposals (pending or edited) can be revised",
+                        p.status.as_str()
+                    );
+                }
+                p.payload = payload;
+                p.status = proposal::ProposalStatus::Edited;
+                proposal::save(&root, &p)?;
+                tracing::debug!(id = %id, "AI proposal revised by the author");
+                vec![Event::ProposalRevised { id }]
             }
         };
 
@@ -1221,6 +1247,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("rejected"), "{err}");
+    }
+
+    #[test]
+    fn proposal_revise_edits_payload_and_still_applies() {
+        let tmp = TempDir::new().unwrap();
+        let body = "one two three\n";
+        let (mut core, rel) = chapter_core(&tmp, body);
+        let (id, _) = proposal_create(&mut core, &rel, body, "two", "too");
+
+        // The author edits the payload; status becomes `edited`.
+        let events = core
+            .execute(Command::ProposalRevise {
+                id: id.clone(),
+                payload: "2".into(),
+            })
+            .unwrap();
+        assert!(matches!(events[0], Event::ProposalRevised { .. }));
+        let p = core.proposal(&id).unwrap().unwrap();
+        assert_eq!(p.status, ProposalStatus::Edited);
+        assert_eq!(p.payload, "2");
+
+        // An edited proposal still applies — with the revised payload.
+        core.execute(Command::ProposalApply { id: id.clone() })
+            .unwrap();
+        assert_eq!(core.read_document(&rel).unwrap().body(), "one 2 three\n");
+        assert_eq!(
+            core.proposal(&id).unwrap().unwrap().status,
+            ProposalStatus::Accepted
+        );
+
+        // Spent proposals can't be revised.
+        let err = core
+            .execute(Command::ProposalRevise {
+                id,
+                payload: "x".into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("edited"), "{err}");
     }
 
     #[test]
