@@ -39,6 +39,7 @@ pub const DEFAULT_BUDGET: usize = 4096;
 /// One operation's identity: the name recorded on proposals and the
 /// prompt-template version, so results stay comparable across changes
 /// (A8 prompt versioning).
+#[derive(Debug)]
 pub struct OperationSpec {
     pub name: &'static str,
     pub prompt_version: &'static str,
@@ -97,9 +98,23 @@ pub enum PayloadFormat {
     JsonOutline,
     /// Constrained-decoding JSON issues, rendered as a report.
     JsonReview,
+    /// Free text becomes a new `## <heading>` lyrics section (Phase 10
+    /// generate-section). The heading is pinned at prepare time.
+    SectionHeading { heading: String },
+    /// Free-text lines become a `song.yaml` `plan:` block (Phase 10
+    /// song-structure). `leading_newline` pads a block appended to a file
+    /// that does not end with a newline — decided from the real body.
+    PlanBlock { leading_newline: bool },
+    /// Constrained-decoding JSON alternates, rendered as a numbered list.
+    JsonAlternatives,
+    /// Constrained-decoding JSON observations, rendered as a report.
+    JsonObservations,
+    /// Constrained-decoding JSON singability verdict, rendered as a report.
+    JsonSingability,
 }
 
 /// An operation fully resolved against project state, ready to generate.
+#[derive(Debug)]
 pub struct Prepared {
     pub spec: &'static OperationSpec,
     pub request: GenerationRequest,
@@ -253,11 +268,11 @@ fn chapter_doc(core: &Core, key: &str) -> Result<(ChapterContext, PathBuf)> {
     Ok((ctx, rel))
 }
 
-fn task_line(spec: &OperationSpec, task: &str) -> String {
+pub(crate) fn task_line(spec: &OperationSpec, task: &str) -> String {
     format!("Operation: {}\n{task}", spec.name)
 }
 
-fn validate_range(body: &str, start: usize, end: usize) -> Result<()> {
+pub(crate) fn validate_range(body: &str, start: usize, end: usize) -> Result<()> {
     if start > end
         || end > body.len()
         || !body.is_char_boundary(start)
@@ -559,6 +574,27 @@ pub fn complete(ai: &Ai, prepared: Prepared, sink: &mut dyn FnMut(&str)) -> Resu
         PayloadFormat::SummaryHeading { title } => format!("## {title}\n{output}"),
         PayloadFormat::JsonOutline => render_outline(&parse_outline(&output)?),
         PayloadFormat::JsonReview => render_review(&parse_review(&output)?),
+        PayloadFormat::SectionHeading { heading } => {
+            format!("\n## {heading}\n\n{}\n", output.trim_end())
+        }
+        PayloadFormat::PlanBlock { leading_newline } => {
+            let pad = if *leading_newline { "\n" } else { "" };
+            // The trailing newline stays: replacing the middle of a
+            // `song.yaml` must not glue the payload onto the next key.
+            format!(
+                "{pad}{}\n",
+                crate::music_ops::render_plan(&output).trim_end()
+            )
+        }
+        PayloadFormat::JsonAlternatives => {
+            crate::music_ops::render_alternatives(&crate::music_ops::parse_alternatives(&output)?)
+        }
+        PayloadFormat::JsonObservations => {
+            crate::music_ops::render_observations(&crate::music_ops::parse_observations(&output)?)
+        }
+        PayloadFormat::JsonSingability => {
+            crate::music_ops::render_singability(&crate::music_ops::parse_singability(&output)?)
+        }
     };
     Ok(Draft {
         operation: prepared.spec.name.to_string(),

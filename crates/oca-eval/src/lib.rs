@@ -13,8 +13,11 @@
 mod fixtures;
 mod graders;
 
-pub use fixtures::{CHAPTER_TWO_SCENES, story_project};
-pub use graders::{Grade, Grader, NonEmpty, PreservesNamedEntities, SchemaValidity, SummaryLength};
+pub use fixtures::{CHAPTER_TWO_SCENES, SONG_TWO_SECTIONS, song_project, story_project};
+pub use graders::{
+    Grade, Grader, NonEmpty, PreservesHook, PreservesNamedEntities, PreservesRhymeScheme,
+    SchemaValidity, SummaryLength,
+};
 
 use anyhow::Result;
 use oca_core::Core;
@@ -28,4 +31,17 @@ pub fn character_names(core: &Core) -> Result<Vec<String>> {
         .into_iter()
         .map(|c| c.name)
         .collect())
+}
+
+/// The song's hook line — [`oca_music::Lyrics::hook_line`], the first
+/// chorus line — the input to [`PreservesHook`] (identity comes from the
+/// music engine, never from the model).
+pub fn song_hook(core: &Core, key: &str) -> Result<String> {
+    let song = oca_music::Music::new(core).song(key)?;
+    song.lyrics.hook_line().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} has no chorus yet — no hook to preserve",
+            song.entry.slug()
+        )
+    })
 }

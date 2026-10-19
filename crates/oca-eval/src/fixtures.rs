@@ -69,3 +69,33 @@ pub fn story_project(root: &Path) -> Result<Core> {
     core.refresh_index()?;
     Ok(core)
 }
+
+/// The fixture song: a rhyming verse (four/door — scheme `a a`) and a
+/// chorus whose first line is the hook ("Keep the light on").
+pub const SONG_TWO_SECTIONS: &str = "\
+# Harbor Lantern
+
+## Verse 1
+The ferry lamps go out at four
+the harbor locks its own back door
+
+## Chorus
+Keep the light on
+the kettle keeps its slow repose
+";
+
+/// Create the seeded song project under `root` and return an open Core
+/// over it: `music/songs/lantern/` with authored lyrics.
+pub fn song_project(root: &Path) -> Result<Core> {
+    std::fs::create_dir_all(root)?;
+    let mut core = Core::new();
+    core.execute(Command::CreateProject {
+        root: root.to_path_buf(),
+        title: "Test Songs".into(),
+        kind: ProjectKind::Novel,
+    })?;
+    let entry = oca_music::Music::new_song(&mut core, "lantern", "Harbor Lantern")?;
+    core.save_body(&entry.lyrics_rel, SONG_TWO_SECTIONS)?;
+    core.refresh_index()?;
+    Ok(core)
+}

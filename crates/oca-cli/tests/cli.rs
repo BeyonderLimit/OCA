@@ -1243,6 +1243,212 @@ fn manuscript_contains(root: &Path, needle: &str) -> bool {
     })
 }
 
+/// A one-song project for the Phase 10 music AI tests: `lantern` with a
+/// rhyming verse (four/door — scheme `a a`) and a chorus whose first line
+/// is the hook.
+fn sample_song(home: &Path, work: &Path) -> std::path::PathBuf {
+    let out = run(home, work, &["new", "song-tests"]);
+    stdout_of(&out);
+    let root = work.join("song-tests");
+    let out = run_in(home, work, &root, &["song", "new", "Lantern"]);
+    stdout_of(&out);
+    std::fs::write(
+        root.join("music/songs/lantern/lyrics.md"),
+        "\
+# Lantern
+
+## Verse 1
+The ferry lamps go out at four
+the harbor locks its own back door
+
+## Chorus
+Keep the light on
+the kettle keeps its slow repose
+",
+    )
+    .unwrap();
+    root
+}
+
+/// Byte range of a selection inside the song's lyrics.
+fn lyrics_range(root: &Path, needle: &str) -> (String, String) {
+    let body = std::fs::read_to_string(root.join("music/songs/lantern/lyrics.md")).unwrap();
+    let start = body.find(needle).expect("selection in fixture");
+    (start.to_string(), (start + needle.len()).to_string())
+}
+
+/// Phase 10 exit, CLI half: with the built-in scripted model, improving a
+/// selection's rhyme records a proposal, lands only on accept, and undoes
+/// via snapshot restore — and the song still checks clean afterwards
+/// (deterministic tools grade both sides).
+#[test]
+fn phase10_exit_improve_rhyme_proposal_apply_then_undo() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let root = sample_song(&home, &work);
+    write_ai_config(&home, "[ai]\nmock = true\n");
+
+    let lyrics = root.join("music/songs/lantern/lyrics.md");
+    let before = std::fs::read_to_string(&lyrics).unwrap();
+    let needle = "The ferry lamps go out at four\nthe harbor locks its own back door";
+    let (start, end) = lyrics_range(&root, needle);
+
+    // The operation records a proposal and writes nothing on its own.
+    let recorded = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &[
+            "ai",
+            "improve-rhyme",
+            "lantern",
+            "--start",
+            &start,
+            "--end",
+            &end,
+        ],
+    );
+    let stdout = stdout_of(&recorded);
+    assert!(stdout.contains("proposal prop_"), "got: {stdout}");
+    let id: String = stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("prop_"))
+        .unwrap()
+        .to_string();
+    assert_eq!(std::fs::read_to_string(&lyrics).unwrap(), before);
+
+    // Accept: the verse is replaced by the rhymed rewrite.
+    let applied = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["proposal", "apply", &id],
+    ));
+    assert!(applied.contains("applied"), "got: {applied}");
+    let after = std::fs::read_to_string(&lyrics).unwrap();
+    assert!(after.contains("until the door"), "got: {after}");
+    assert!(!after.contains(needle), "old verse replaced: {after}");
+    // The deterministic tools still pass over the applied result.
+    let check = run_in(&home, tmp.path(), &root, &["song", "check", "lantern"]);
+    assert!(check.status.success(), "song check must stay green");
+
+    // Undo: the pre-apply snapshot restores the exact original bytes.
+    stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["snapshot", "restore", "1"],
+    ));
+    assert_eq!(std::fs::read_to_string(&lyrics).unwrap(), before);
+}
+
+/// Phase 10 reports stay reports: analyze, singability, and song-concept
+/// print for the author and never become proposals.
+#[test]
+fn phase10_music_reports_are_report_only() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let root = sample_song(&home, &work);
+    write_ai_config(&home, "[ai]\nmock = true\n");
+
+    let analyze = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["ai", "analyze", "lantern"],
+    ));
+    assert!(analyze.contains("structure"), "got: {analyze}");
+    let sing = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["ai", "singability", "lantern"],
+    ));
+    assert!(sing.contains("Singable"), "got: {sing}");
+    let concept = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["ai", "song-concept", "lantern"],
+    ));
+    assert!(concept.contains("Kept Light"), "got: {concept}");
+
+    let list = stdout_of(&run_in(&home, tmp.path(), &root, &["proposal", "list"]));
+    assert!(
+        !list.contains("analyze") && !list.contains("song_concept"),
+        "reports are never proposals: {list}"
+    );
+}
+
+/// Phase 10 with no model: an actionable error and untouched lyrics
+/// (rule 3: AI is optional). With the mock, a selection without the hook
+/// refuses honestly instead of guessing.
+#[test]
+fn phase10_music_operation_errors_are_actionable() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let root = sample_song(&home, &work);
+    let lyrics = root.join("music/songs/lantern/lyrics.md");
+    let before = std::fs::read_to_string(&lyrics).unwrap();
+    let verse = "The ferry lamps go out at four\nthe harbor locks its own back door";
+    let (start, end) = lyrics_range(&root, verse);
+
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &[
+            "ai",
+            "improve-rhyme",
+            "lantern",
+            "--start",
+            &start,
+            "--end",
+            &end,
+        ],
+    );
+    assert!(!out.status.success(), "no model, no operation");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mock = true") || stderr.contains("runtime install"),
+        "the error should say how to proceed: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&lyrics).unwrap(), before);
+
+    // With the mock: preserve-hook over the verse (which does not carry
+    // the hook) refuses — the constraint is checked, not waved through.
+    write_ai_config(&home, "[ai]\nmock = true\n");
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &[
+            "ai",
+            "preserve-hook",
+            "lantern",
+            "--start",
+            &start,
+            "--end",
+            &end,
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a selection without the hook must refuse"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not in this selection"), "{stderr}");
+}
+
 /// Phase 7B exit, CLI half: with **only** a whisper stand-in installed,
 /// `oca dictate` transcribes, stores the raw transcript with the take, and
 /// sends it further only where explicitly asked — never on its own.

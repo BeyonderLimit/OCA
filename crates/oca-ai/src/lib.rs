@@ -31,6 +31,7 @@ mod subprocess;
 mod whisper;
 
 pub mod context;
+pub mod music_ops;
 pub mod operations;
 
 pub use context::{
@@ -41,6 +42,18 @@ pub use context::{
 };
 pub use hardware::{Hardware, Tier};
 pub use mock::{MockModel, Script};
+pub use music_ops::{
+    ALTERNATIVES, ANALYZE_SONG, Alternatives, CHECK_SINGABILITY, GENERATE_SECTION, IMPROVE_METER,
+    IMPROVE_RHYME, Observation, Observations, PRESERVE_HOOK, PRESERVE_RHYME_SCHEME, REWRITE_LYRICS,
+    SONG_CONCEPT, SONG_STRUCTURE, SingProblem, Singability,
+    alternatives_schema as alternatives_json_schema,
+    observations_schema as observations_json_schema, parse_alternatives, parse_observations,
+    parse_singability, prepare_alternatives, prepare_analyze_song, prepare_check_singability,
+    prepare_generate_section, prepare_improve_meter, prepare_improve_rhyme, prepare_preserve_hook,
+    prepare_preserve_rhyme_scheme, prepare_rewrite_lyrics, prepare_song_concept,
+    prepare_song_structure, render_alternatives, render_observations, render_plan,
+    render_singability, singability_schema as singability_json_schema,
+};
 pub use operations::{
     CONTINUE_SCENE, DEFAULT_BUDGET, Draft, DraftTarget, GENERATE_OUTLINE, OperationSpec, Outline,
     OutlineSection, PayloadFormat, Prepared, REVIEW_CHAPTER, REWRITE_SELECTION, Review,
@@ -409,19 +422,21 @@ pub struct BootstrapOptions {
     /// Replace the standard whisper arguments entirely — test doubles and
     /// nonstandard runtimes, mirroring [`ModelConfig::server_args`].
     pub whisper_args: Option<Vec<String>>,
-    /// Use the built-in scripted model (`MockModel::story_defaults`) — for
-    /// offline demos and tests; no runtime or model files involved.
+    /// Use the built-in scripted model (`MockModel::ai_defaults` — story
+    /// and music operations) — for offline demos and tests; no runtime or
+    /// model files involved.
     pub mock: bool,
 }
 
 /// Build the AI facade if a runtime *and* a model are present; `None` means
 /// "no AI available" — every feature keeps working without it (rule 3).
 pub fn bootstrap(opts: &BootstrapOptions) -> Result<Option<Ai>> {
-    // The offline/demo path (Phase 9): the built-in scripted model, which
-    // needs no runtime and no model files — deleting them cannot break it.
+    // The offline/demo path (Phases 9/10): the built-in scripted model,
+    // which needs no runtime and no model files — deleting them cannot
+    // break it.
     if opts.mock {
         return Ok(Some(Ai::new(
-            Arc::new(MockModel::story_defaults()),
+            Arc::new(MockModel::ai_defaults()),
             Vec::new(),
         )));
     }

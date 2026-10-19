@@ -34,3 +34,4 @@ results such as ADR-0021). Full rationale lives in
 | [0026](0026-dictation.md) | Phase 7B | Dictation: `Transcriber` seam, one-shot whisper, preview-only cleanup |
 | [0027](0027-context-engine-proposals.md) | Phase 8 | Context engine, token budgets, and the proposal store |
 | [0028](0028-story-ai-operations.md) | Phase 9 | Story AI operations, universal proposal UX, `oca-eval` graders |
+| [0029](0029-music-ai-operations.md) | Phase 10 | Music AI operations, deterministic lyric scores shared three ways |

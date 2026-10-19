@@ -218,14 +218,30 @@ enum AiState {
     Streaming,
 }
 
-/// Which Phase 9 story operation a streaming job is producing.
+/// Which operation a streaming job is producing — story (Phase 9) or
+/// music (Phase 10); the open document decides which keys reach which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpKind {
+    // Story (Phase 9)
     Continue,
     Rewrite,
     Summarize,
     Outline,
     Review,
+    // Music (Phase 10)
+    SongConcept,
+    SongStructure,
+    Verse,
+    Chorus,
+    Bridge,
+    RewriteLyrics,
+    ImproveRhyme,
+    ImproveMeter,
+    PreserveHook,
+    PreserveRhymeScheme,
+    Alternatives,
+    Analyze,
+    Singability,
 }
 
 impl OpKind {
@@ -237,8 +253,25 @@ impl OpKind {
             OpKind::Summarize => oca_ai::SUMMARIZE_CHAPTER.name,
             OpKind::Outline => oca_ai::GENERATE_OUTLINE.name,
             OpKind::Review => oca_ai::REVIEW_CHAPTER.name,
+            OpKind::SongConcept => oca_ai::SONG_CONCEPT.name,
+            OpKind::SongStructure => oca_ai::SONG_STRUCTURE.name,
+            OpKind::Verse | OpKind::Chorus | OpKind::Bridge => oca_ai::GENERATE_SECTION.name,
+            OpKind::RewriteLyrics => oca_ai::REWRITE_LYRICS.name,
+            OpKind::ImproveRhyme => oca_ai::IMPROVE_RHYME.name,
+            OpKind::ImproveMeter => oca_ai::IMPROVE_METER.name,
+            OpKind::PreserveHook => oca_ai::PRESERVE_HOOK.name,
+            OpKind::PreserveRhymeScheme => oca_ai::PRESERVE_RHYME_SCHEME.name,
+            OpKind::Alternatives => oca_ai::ALTERNATIVES.name,
+            OpKind::Analyze => oca_ai::ANALYZE_SONG.name,
+            OpKind::Singability => oca_ai::CHECK_SINGABILITY.name,
         }
     }
+}
+
+/// `music/songs/<slug>/lyrics.md` → `<slug>`; `None` for anything else.
+/// The open document decides which operations the AI panel offers.
+fn song_slug_of(rel: &str) -> Option<&str> {
+    rel.strip_prefix("music/songs/")?.strip_suffix("/lyrics.md")
 }
 
 /// The AI proposals panel (Phase 9): the proposal list, plus a side-by-side
@@ -254,7 +287,10 @@ struct ProposalPanel {
 enum PropMode {
     List,
     /// Side-by-side review of the selected proposal. `editing` is the
-    /// payload editor while the author has pressed `e`.
+    /// payload editor while the author has pressed `e`. `scores` carries
+    /// the deterministic rhyme/meter scores for both sides when the
+    /// proposal targets a song's lyrics (Phase 10: "scores computed
+    /// deterministically for both").
     Detail {
         original: String,
         proposed: String,
@@ -262,6 +298,10 @@ enum PropMode {
         /// Boxed: the rope editor is heavy — it belongs on the heap while
         /// an edit is in progress, not inside every mode switch.
         editing: Option<Box<Editor>>,
+        /// (current draft, proposal) lyric scores — set when the proposal
+        /// targets a song's lyrics, computed once when the review opens.
+        /// Boxed: four `Vec`s per side would dwarf the mode enum.
+        scores: Option<Box<(oca_music::LyricScores, oca_music::LyricScores)>>,
     },
 }
 
@@ -664,12 +704,17 @@ impl App {
             report: None,
         });
         self.focus = Focus::Ai;
-        self.status = if self.ai.is_some() {
+        self.status = if self.ai.is_none() {
+            "AI panel — no runtime installed (AI is optional)".into()
+        } else if self.song.is_some() {
+            "AI panel — l load, u unload · s structure, v verse, c chorus, b bridge, \
+             w rewrite, r rhyme, m meter, k hook, p scheme, n concept, a alternatives, \
+             g analyze, i singable · Esc close"
+                .into()
+        } else {
             "AI panel — l load, u unload, t probe · c continue, w rewrite, s summarize, \
              o outline, r review · Esc close"
                 .into()
-        } else {
-            "AI panel — no runtime installed (AI is optional)".into()
         };
     }
 
@@ -750,6 +795,25 @@ impl App {
                     self.status = "generating — Esc stops".into();
                 }
             }
+            // Operations, keyed by what's open: a song's lyrics take the
+            // music operations (Phase 10), a chapter the story ones
+            // (Phase 9). The panel keys (l/u/t) stay shared.
+            KeyCode::Char(k) if self.song.is_some() => match k {
+                'n' => self.start_op(core, &mut panel, OpKind::SongConcept),
+                's' => self.start_op(core, &mut panel, OpKind::SongStructure),
+                'v' => self.start_op(core, &mut panel, OpKind::Verse),
+                'c' => self.start_op(core, &mut panel, OpKind::Chorus),
+                'b' => self.start_op(core, &mut panel, OpKind::Bridge),
+                'w' => self.start_op(core, &mut panel, OpKind::RewriteLyrics),
+                'r' => self.start_op(core, &mut panel, OpKind::ImproveRhyme),
+                'm' => self.start_op(core, &mut panel, OpKind::ImproveMeter),
+                'k' => self.start_op(core, &mut panel, OpKind::PreserveHook),
+                'p' => self.start_op(core, &mut panel, OpKind::PreserveRhymeScheme),
+                'a' => self.start_op(core, &mut panel, OpKind::Alternatives),
+                'g' => self.start_op(core, &mut panel, OpKind::Analyze),
+                'i' => self.start_op(core, &mut panel, OpKind::Singability),
+                _ => {}
+            },
             // Phase 9 story operations — smallest first: continue →
             // rewrite → summarize → outline → review.
             KeyCode::Char('c') => self.start_op(core, &mut panel, OpKind::Continue),
@@ -762,11 +826,12 @@ impl App {
         self.ai_panel = Some(panel);
     }
 
-    /// Start a Phase 9 story operation as a job: preparation runs on the
-    /// main thread (deterministic — it resolves the exact target range and
-    /// prompt, no model involved), then the generation streams in the job
-    /// thread; the finished draft becomes a Core proposal. A review answers
-    /// as a report instead (§7.4).
+    /// Start an operation as a job: preparation runs on the main thread
+    /// (deterministic — it resolves the exact target range and prompt, no
+    /// model involved), then the generation streams in the job thread; the
+    /// finished draft becomes a Core proposal. Reports answer as a report
+    /// instead (§7.4). The open document decides story (Phase 9) vs music
+    /// (Phase 10) — lyrics.md targets the open song.
     fn start_op(&mut self, core: &mut Core, panel: &mut AiPanel, op: OpKind) {
         if panel.job.is_some() {
             panel.error = Some("still busy — Esc stops the current run".into());
@@ -780,37 +845,106 @@ impl App {
             panel.error = Some("load the model first (l)".into());
             return;
         }
-        let chapter_key = self
+        let open = self
             .open_rel
             .as_ref()
             .map(|rel| rel.to_string_lossy().into_owned());
+        let song = open.as_deref().and_then(song_slug_of).map(str::to_string);
         let budget = oca_ai::DEFAULT_BUDGET;
-        let prepared = match (op, &chapter_key) {
-            (OpKind::Outline, _) => oca_ai::prepare_generate_outline(core, budget),
-            (OpKind::Continue, Some(chapter)) => {
+        // Selection-based operations share one gate.
+        let selected = self.selection_range();
+        let need_selection =
+            || anyhow::anyhow!("select the lyric lines first — Shift+arrows or drag selects");
+        let prepared = match (op, &song, open.as_deref()) {
+            // ---- music operations (Phase 10) ----
+            (OpKind::SongConcept, Some(song), _) => {
+                oca_ai::prepare_song_concept(core, song, budget)
+            }
+            (OpKind::SongStructure, Some(song), _) => {
+                oca_ai::prepare_song_structure(core, song, budget)
+            }
+            (OpKind::Verse, Some(song), _) => {
+                oca_ai::prepare_generate_section(core, song, "Verse", budget)
+            }
+            (OpKind::Chorus, Some(song), _) => {
+                oca_ai::prepare_generate_section(core, song, "Chorus", budget)
+            }
+            (OpKind::Bridge, Some(song), _) => {
+                oca_ai::prepare_generate_section(core, song, "Bridge", budget)
+            }
+            (OpKind::RewriteLyrics, Some(song), _) => match selected {
+                Some((start, end)) => {
+                    oca_ai::prepare_rewrite_lyrics(core, song, start, end, None, budget)
+                }
+                None => Err(need_selection()),
+            },
+            (OpKind::ImproveRhyme, Some(song), _) => match selected {
+                Some((start, end)) => oca_ai::prepare_improve_rhyme(core, song, start, end, budget),
+                None => Err(need_selection()),
+            },
+            (OpKind::ImproveMeter, Some(song), _) => match selected {
+                Some((start, end)) => oca_ai::prepare_improve_meter(core, song, start, end, budget),
+                None => Err(need_selection()),
+            },
+            (OpKind::PreserveHook, Some(song), _) => match selected {
+                Some((start, end)) => oca_ai::prepare_preserve_hook(core, song, start, end, budget),
+                None => Err(need_selection()),
+            },
+            (OpKind::PreserveRhymeScheme, Some(song), _) => match selected {
+                Some((start, end)) => {
+                    oca_ai::prepare_preserve_rhyme_scheme(core, song, start, end, budget)
+                }
+                None => Err(need_selection()),
+            },
+            (OpKind::Alternatives, Some(song), _) => match selected {
+                Some((start, end)) => oca_ai::prepare_alternatives(core, song, start, end, budget),
+                None => Err(need_selection()),
+            },
+            (OpKind::Analyze, Some(song), _) => oca_ai::prepare_analyze_song(core, song, budget),
+            (OpKind::Singability, Some(song), _) => {
+                oca_ai::prepare_check_singability(core, song, budget)
+            }
+            // A music operation with a non-song document open.
+            (
+                OpKind::SongConcept
+                | OpKind::SongStructure
+                | OpKind::Verse
+                | OpKind::Chorus
+                | OpKind::Bridge
+                | OpKind::RewriteLyrics
+                | OpKind::ImproveRhyme
+                | OpKind::ImproveMeter
+                | OpKind::PreserveHook
+                | OpKind::PreserveRhymeScheme
+                | OpKind::Alternatives
+                | OpKind::Analyze
+                | OpKind::Singability,
+                _,
+                _,
+            ) => Err(anyhow::anyhow!(
+                "open a song's lyrics first — this operation works on the open song"
+            )),
+            // ---- story operations (Phase 9) ----
+            (OpKind::Outline, _, _) => oca_ai::prepare_generate_outline(core, budget),
+            (OpKind::Continue, _, Some(chapter)) => {
                 let at = self.editor.cursor();
                 oca_ai::prepare_continue_scene(core, chapter, at, budget)
             }
-            (OpKind::Rewrite, Some(chapter)) => match self.editor.selection() {
-                Some(range) if !range.is_empty() => oca_ai::prepare_rewrite_selection(
-                    core,
-                    chapter,
-                    range.start,
-                    range.end,
-                    None,
-                    budget,
-                ),
-                _ => Err(anyhow::anyhow!(
+            (OpKind::Rewrite, _, Some(chapter)) => match selected {
+                Some((start, end)) => {
+                    oca_ai::prepare_rewrite_selection(core, chapter, start, end, None, budget)
+                }
+                None => Err(anyhow::anyhow!(
                     "select the text to rewrite first (Shift+arrows)"
                 )),
             },
-            (OpKind::Summarize, Some(chapter)) => {
+            (OpKind::Summarize, _, Some(chapter)) => {
                 oca_ai::prepare_summarize_chapter(core, chapter, budget)
             }
-            (OpKind::Review, Some(chapter)) => {
+            (OpKind::Review, _, Some(chapter)) => {
                 oca_ai::prepare_review_chapter(core, chapter, budget)
             }
-            (_, None) => Err(anyhow::anyhow!(
+            (_, _, None) => Err(anyhow::anyhow!(
                 "open a chapter first — this operation works on the open document"
             )),
         };
@@ -958,6 +1092,32 @@ impl App {
         (original, p.payload.clone())
     }
 
+    /// Deterministic rhyme/meter scores for both sides of a lyrics
+    /// proposal — the Phase 10 review shows them beside each column.
+    /// `None` for any proposal that does not target a song's lyrics
+    /// (all the scoring lives in `oca-music`, rule 8).
+    fn proposal_scores(
+        core: &Core,
+        p: &oca_core::Proposal,
+        original: &str,
+        proposed: &str,
+    ) -> Option<Box<(oca_music::LyricScores, oca_music::LyricScores)>> {
+        let rel = p.target.document.to_string_lossy();
+        let slug = song_slug_of(&rel)?;
+        let music = oca_music::Music::new(core);
+        let left = music.score_block(slug, original).ok()?;
+        let right = music.score_block(slug, proposed).ok()?;
+        Some(Box::new((left, right)))
+    }
+
+    /// The editor selection as a byte range, when the author has one.
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        self.editor
+            .selection()
+            .filter(|r| !r.is_empty())
+            .map(|r| (r.start, r.end))
+    }
+
     fn proposal_key(&mut self, core: &mut Core, key: KeyEvent) {
         let Some(mut panel) = self.proposal_panel.take() else {
             return;
@@ -1036,11 +1196,13 @@ impl App {
                 PropMode::List => {
                     if let Some(p) = panel.proposals.get(panel.sel) {
                         let (original, proposed) = Self::proposal_columns(core, p);
+                        let scores = Self::proposal_scores(core, p, &original, &proposed);
                         panel.mode = PropMode::Detail {
                             original,
                             proposed,
                             scroll: 0,
                             editing: None,
+                            scores,
                         };
                     }
                 }
@@ -1052,6 +1214,7 @@ impl App {
                     && p.status.is_undecided()
                 {
                     let (original, proposed) = Self::proposal_columns(core, &p);
+                    let scores = Self::proposal_scores(core, &p, &original, &proposed);
                     let mut editor = Box::new(Editor::new());
                     editor.load(&proposed);
                     panel.mode = PropMode::Detail {
@@ -1059,6 +1222,7 @@ impl App {
                         proposed,
                         scroll: 0,
                         editing: Some(editor),
+                        scores,
                     };
                     self.status = "editing the proposal — Ctrl-S saves it, Esc discards".into();
                 }
@@ -2408,11 +2572,15 @@ impl App {
             }
         }
         lines.push(Line::from(""));
-        lines.push(Line::styled(
+        let hint = if self.song.is_some() {
+            "l load · u unload · s structure · v verse · c chorus · b bridge · \
+             w rewrite · r rhyme · m meter · k hook · p scheme · n concept · \
+             a alternatives · g analyze · i singable · Esc close"
+        } else {
             "l load · u unload · t probe · c continue · w rewrite · s summarize · \
-             o outline · r review · Esc close",
-            Style::new().fg(Color::DarkGray),
-        ));
+             o outline · r review · Esc close"
+        };
+        lines.push(Line::styled(hint, Style::new().fg(Color::DarkGray)));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
@@ -2468,6 +2636,7 @@ impl App {
                 proposed,
                 scroll,
                 editing,
+                scores,
             } => {
                 let area = centered(frame.area(), 100, 26);
                 let block = Block::default()
@@ -2480,9 +2649,33 @@ impl App {
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(inner);
 
-                let left_block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Current Draft ");
+                // Deterministic scores, both sides, when the proposal is
+                // over lyrics — computed once when the review opened.
+                let compact = |s: &oca_music::LyricScores| {
+                    let syl = s
+                        .syllables
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "—".into());
+                    let meter = s.meter.map(|n| n.to_string()).unwrap_or_else(|| "—".into());
+                    let scheme = if s.rhyme_scheme.is_empty() {
+                        "—".to_string()
+                    } else {
+                        s.rhyme_scheme.join(" ")
+                    };
+                    format!("{syl} syll · {meter}/line · {scheme}")
+                };
+                let left_title = match scores.as_deref() {
+                    Some((left, _)) => format!(" Current Draft · {} ", compact(left)),
+                    None => " Current Draft ".to_string(),
+                };
+                let right_title = match scores.as_deref() {
+                    Some((_, right)) if editing.is_none() => {
+                        format!(" AI Proposed Revision · {} ", compact(right))
+                    }
+                    _ => " AI Proposed Revision ".to_string(),
+                };
+
+                let left_block = Block::default().borders(Borders::ALL).title(left_title);
                 let left_area = left_block.inner(cols[0]);
                 frame.render_widget(left_block, cols[0]);
                 frame.render_widget(
@@ -2504,9 +2697,7 @@ impl App {
                         editor.render(right_area, frame.buffer_mut(), true);
                     }
                     None => {
-                        let right_block = Block::default()
-                            .borders(Borders::ALL)
-                            .title(" AI Proposed Revision ");
+                        let right_block = Block::default().borders(Borders::ALL).title(right_title);
                         let right_area = right_block.inner(cols[1]);
                         frame.render_widget(right_block, cols[1]);
                         frame.render_widget(
@@ -2757,6 +2948,9 @@ impl App {
             }
             Focus::Search => " type filter · ↑↓ select · Enter open · Esc close",
             Focus::Snapshots => " ↑↓ select · c save now · Enter diff · r restore · Esc close",
+            Focus::Ai if self.song.is_some() => {
+                " l load · u unload · s structure · v/c/b sections · w rewrite · r rhyme · m meter · k hook · p scheme · n concept · a alternatives · g analyze · i singable · Esc close"
+            }
             Focus::Ai => {
                 " l load · u unload · t probe · c continue · w rewrite · s summarize · o outline · r review · Esc close"
             }
@@ -4544,5 +4738,194 @@ hold on to the light
         assert!(text.contains("Current Draft"), "{text}");
         assert!(text.contains("AI Proposed Revision"), "{text}");
         assert!(text.contains("too"), "payload column shows the revision");
+    }
+
+    /// Phase 10, TUI half: with a song's lyrics open the AI panel takes
+    /// the music keys — improve-rhyme over a selection records a proposal
+    /// against exactly that range (rule 4: the lyrics stay untouched),
+    /// and `c` means *chorus*, not *continue*, in the song context.
+    #[test]
+    fn music_operations_record_proposals_for_the_open_song() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _chapter) = project_with_chapter(&tmp);
+        let entry = oca_music::Music::new_song(&mut core, "lantern", "Lantern").unwrap();
+        const LYRICS: &str = "\
+# Lantern
+
+## Verse 1
+The ferry lamps go out at four
+the harbor locks its own back door
+
+## Chorus
+Keep the light on
+the kettle keeps its slow repose
+";
+        core.execute(Command::SaveDocument {
+            doc: entry.lyrics_rel.clone(),
+            raw: LYRICS.into(),
+        })
+        .unwrap();
+
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        let ai = Ai::new(Arc::new(oca_ai::MockModel::ai_defaults()), Vec::new());
+        ai.load().unwrap();
+        app.attach_ai(ai);
+        app.open_doc(&mut core, entry.lyrics_rel.clone());
+        assert!(app.song.is_some(), "lyrics.md wires up the song context");
+
+        // Select the two verse lines, then improve their rhyme.
+        let needle = "The ferry lamps go out at four\nthe harbor locks its own back door";
+        let start = app.editor.text().find(needle).expect("verse in fixture");
+        app.focus = Focus::Editor;
+        app.editor.goto_char(start);
+        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        for _ in 0..needle.len() {
+            app.on_key(&mut core, shift_right).unwrap();
+        }
+        app.on_key(&mut core, key(KeyCode::Tab)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap(); // improve rhyme (song)
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        {
+            let proposals = core.proposals().unwrap();
+            assert_eq!(proposals.len(), 1);
+            assert_eq!(proposals[0].operation, "improve_rhyme");
+            assert_eq!(proposals[0].target.document, entry.lyrics_rel);
+            assert_eq!(
+                (proposals[0].target.start, proposals[0].target.end),
+                (start, start + needle.len()),
+                "the proposal targets exactly the selection"
+            );
+            assert!(
+                proposals[0].payload.contains("until the door"),
+                "{}",
+                proposals[0].payload
+            );
+        }
+        // Rule 4: the lyrics are untouched until the author accepts.
+        assert_eq!(body_of(&core, &entry.lyrics_rel), LYRICS);
+
+        // In the song context `c` generates a chorus — it is not story
+        // continue. The new section arrives as an append proposal.
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        {
+            let proposals = core.proposals().unwrap();
+            assert_eq!(proposals.len(), 2);
+            assert_eq!(proposals[1].operation, "generate_section");
+            assert_eq!(proposals[1].target.document, entry.lyrics_rel);
+            assert_eq!(
+                proposals[1].target.start, proposals[1].target.end,
+                "an appended section replaces nothing"
+            );
+            assert!(
+                proposals[1].payload.contains("\n## Chorus\n\n"),
+                "{}",
+                proposals[1].payload
+            );
+        }
+        assert_eq!(body_of(&core, &entry.lyrics_rel), LYRICS, "still untouched");
+    }
+
+    /// Phase 10 exit, TUI half: the review beside a lyrics proposal shows
+    /// the deterministic rhyme/meter scores of both sides — computed by
+    /// oca-music, never claimed by the model.
+    #[test]
+    fn lyrics_proposal_review_shows_deterministic_scores_for_both_sides() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _chapter) = project_with_chapter(&tmp);
+        let entry = oca_music::Music::new_song(&mut core, "lantern", "Lantern").unwrap();
+        core.execute(Command::SaveDocument {
+            doc: entry.lyrics_rel.clone(),
+            raw: "\
+# Lantern
+
+## Verse 1
+The ferry lamps go out at four
+the harbor locks its own back door
+"
+            .into(),
+        })
+        .unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        let ai = Ai::new(Arc::new(oca_ai::MockModel::ai_defaults()), Vec::new());
+        ai.load().unwrap();
+        app.attach_ai(ai);
+        app.open_doc(&mut core, entry.lyrics_rel.clone());
+
+        // Run improve-rhyme over the verse via the panel.
+        let needle = "The ferry lamps go out at four\nthe harbor locks its own back door";
+        let start = app.editor.text().find(needle).expect("verse in fixture");
+        app.focus = Focus::Editor;
+        app.editor.goto_char(start);
+        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        for _ in 0..needle.len() {
+            app.on_key(&mut core, shift_right).unwrap();
+        }
+        app.on_key(&mut core, key(KeyCode::Tab)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        settle(&mut app, &mut core, |p| p.state == AiState::Ready);
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap(); // leave the AI panel
+
+        // Review it: Enter opens the side-by-side with scores for both.
+        app.on_key(&mut core, key(KeyCode::Char('p'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        {
+            let panel = app.proposal_panel.as_ref().expect("proposals open");
+            let PropMode::Detail { scores, .. } = &panel.mode else {
+                panic!("expected the side-by-side review");
+            };
+            let (left, right) = scores.as_deref().expect("lyrics proposals carry scores");
+            assert_eq!(left.rhyme_scheme, ["a", "a"], "four/door, measured");
+            assert_eq!(left.syllables, Some(16), "{left:?}");
+            assert!(right.syllables.is_some(), "{right:?}");
+            assert_eq!(right.rhyme_scheme, ["a", "a"], "score/door, measured");
+        }
+        // And the drawn titles carry the numbers.
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw(&core, frame))
+            .expect("review renders");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("16 syll"), "{text}");
+        assert!(text.contains("a a"), "{text}");
+    }
+
+    /// A selection-based music operation with nothing selected refuses
+    /// with an actionable message instead of guessing a range.
+    #[test]
+    fn music_operation_without_a_selection_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _chapter) = project_with_chapter(&tmp);
+        let entry = oca_music::Music::new_song(&mut core, "lantern", "Lantern").unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        let ai = Ai::new(Arc::new(oca_ai::MockModel::ai_defaults()), Vec::new());
+        ai.load().unwrap();
+        app.attach_ai(ai);
+        app.open_doc(&mut core, entry.lyrics_rel.clone());
+
+        app.on_key(&mut core, key(KeyCode::Tab)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        app.on_key(&mut core, key(KeyCode::Char('r'))).unwrap();
+        let panel = app.ai_panel.as_ref().expect("AI panel open");
+        assert_eq!(panel.state, AiState::Ready, "no job started");
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("select the lyric lines"),
+            "actionable error: {:?}",
+            panel.error
+        );
+        assert_eq!(core.proposals().unwrap().len(), 0, "nothing recorded");
     }
 }

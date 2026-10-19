@@ -20,6 +20,7 @@ pub mod library;
 pub mod lyrics;
 pub mod phonetics;
 pub mod rhyme;
+pub mod scores;
 pub mod song;
 pub mod syllable;
 pub mod versions;
@@ -31,6 +32,7 @@ pub use library::{Album, Artist};
 pub use lyrics::{LyricLine, Lyrics, Section, SectionKind};
 pub use phonetics::{EnglishPhonetics, PhoneticProvider, Pronunciation};
 pub use rhyme::{InternalRhyme, RhymeKind, RhymePair, classify, internal_rhymes, rhymes_with};
+pub use scores::{LyricScores, rhyme_scheme, score_lines};
 pub use song::{SongEntry, SongYaml};
 pub use syllable::{LineMetrics, line_metrics, line_syllables, meter};
 pub use versions::VersionRef;
@@ -131,6 +133,16 @@ impl<'c> Music<'c> {
         let song = self.song(key)?;
         let project_language = self.core.project().unwrap().meta().language();
         Ok(check::check(&song.yaml, &song.lyrics, &project_language))
+    }
+
+    /// Deterministic scores for one block of this song's lyric lines —
+    /// what the AI proposal review shows for both the current draft and
+    /// the revision (Phase 10, `OCA-build.md` §7.3). The language comes
+    /// from the song (override → project), never guessed.
+    pub fn score_block(&self, key: &str, text: &str) -> Result<LyricScores> {
+        let song = self.song(key)?;
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        Ok(scores::score_lines(&lines, &song.language))
     }
 
     /// `music/artist.yaml`, when present.

@@ -541,13 +541,28 @@ fn ai_project(cmd: &AiCommand) -> Option<PathBuf> {
         | AiCommand::Rewrite { project, .. }
         | AiCommand::Summarize { project, .. }
         | AiCommand::Outline { project }
-        | AiCommand::Review { project, .. } => project.clone(),
+        | AiCommand::Review { project, .. }
+        | AiCommand::SongConcept { project, .. }
+        | AiCommand::SongStructure { project, .. }
+        | AiCommand::Verse { project, .. }
+        | AiCommand::Chorus { project, .. }
+        | AiCommand::Bridge { project, .. }
+        | AiCommand::RewriteLyrics { project, .. }
+        | AiCommand::ImproveRhyme { project, .. }
+        | AiCommand::ImproveMeter { project, .. }
+        | AiCommand::PreserveHook { project, .. }
+        | AiCommand::PreserveRhymeScheme { project, .. }
+        | AiCommand::Alternatives { project, .. }
+        | AiCommand::Analyze { project, .. }
+        | AiCommand::Singability { project, .. } => project.clone(),
     }
 }
 
-/// Phase 9 story operations. Deterministic preparation resolves the target
-/// range and prompt; the model only ever fills in text; the result lands as
-/// a Core proposal (rule 4) that the author accepts or rejects.
+/// Phases 9/10 story and music operations. Deterministic preparation
+/// resolves the target range and prompt; the model only ever fills in
+/// text; the result lands as a Core proposal (rule 4) that the author
+/// accepts or rejects — reports (review, concept, analyze, singability,
+/// alternatives) are printed and never written.
 fn ai(cmd: AiCommand, cfg: &Config) -> Result<u8> {
     let root = find_project(ai_project(&cmd).as_deref())?;
     let mut core = open_core(&root)?;
@@ -605,6 +620,65 @@ fn ai(cmd: AiCommand, cfg: &Config) -> Result<u8> {
             chapter,
             project: _,
         } => oca_ai::prepare_review_chapter(&core, &chapter, budget)?,
+        // ---- music operations (Phase 10): same pipeline, music targets ----
+        AiCommand::SongConcept { song, project: _ } => {
+            oca_ai::prepare_song_concept(&core, &song, budget)?
+        }
+        AiCommand::SongStructure { song, project: _ } => {
+            oca_ai::prepare_song_structure(&core, &song, budget)?
+        }
+        AiCommand::Verse { song, project: _ } => {
+            oca_ai::prepare_generate_section(&core, &song, "Verse", budget)?
+        }
+        AiCommand::Chorus { song, project: _ } => {
+            oca_ai::prepare_generate_section(&core, &song, "Chorus", budget)?
+        }
+        AiCommand::Bridge { song, project: _ } => {
+            oca_ai::prepare_generate_section(&core, &song, "Bridge", budget)?
+        }
+        AiCommand::RewriteLyrics {
+            song,
+            start,
+            end,
+            guidance,
+            project: _,
+        } => oca_ai::prepare_rewrite_lyrics(&core, &song, start, end, guidance.as_deref(), budget)?,
+        AiCommand::ImproveRhyme {
+            song,
+            start,
+            end,
+            project: _,
+        } => oca_ai::prepare_improve_rhyme(&core, &song, start, end, budget)?,
+        AiCommand::ImproveMeter {
+            song,
+            start,
+            end,
+            project: _,
+        } => oca_ai::prepare_improve_meter(&core, &song, start, end, budget)?,
+        AiCommand::PreserveHook {
+            song,
+            start,
+            end,
+            project: _,
+        } => oca_ai::prepare_preserve_hook(&core, &song, start, end, budget)?,
+        AiCommand::PreserveRhymeScheme {
+            song,
+            start,
+            end,
+            project: _,
+        } => oca_ai::prepare_preserve_rhyme_scheme(&core, &song, start, end, budget)?,
+        AiCommand::Alternatives {
+            song,
+            start,
+            end,
+            project: _,
+        } => oca_ai::prepare_alternatives(&core, &song, start, end, budget)?,
+        AiCommand::Analyze { song, project: _ } => {
+            oca_ai::prepare_analyze_song(&core, &song, budget)?
+        }
+        AiCommand::Singability { song, project: _ } => {
+            oca_ai::prepare_check_singability(&core, &song, budget)?
+        }
     };
 
     let draft = oca_ai::complete(&facade, prepared, &mut |_| {})?;

@@ -304,6 +304,172 @@ pub enum AiCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+
+    /// Describe a song's concept: the central image, title ideas, themes.
+    /// A report: printed for you to read, never written.
+    SongConcept {
+        /// Song slug (`ashes`), id (`song_ashes`), or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Propose the song's structural plan — the `plan:` block in
+    /// song.yaml — as a proposal.
+    SongStructure {
+        /// Song slug, id, or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Generate a new Verse section for a song (appended after its
+    /// current sections) — a proposal.
+    Verse {
+        /// Song slug, id, or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Generate a new Chorus section for a song — a proposal.
+    Chorus {
+        /// Song slug, id, or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Generate a new Bridge section for a song — a proposal.
+    Bridge {
+        /// Song slug, id, or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Rewrite a byte range of a song's lyrics — a proposal.
+    RewriteLyrics {
+        /// Song slug, id, or title.
+        song: String,
+        /// Start byte of the selection in lyrics.md.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in lyrics.md.
+        #[arg(long)]
+        end: usize,
+        /// Style guidance ("warmer", "more image", …).
+        #[arg(long)]
+        guidance: Option<String>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Strengthen the end rhymes of a lyric range, keeping meaning and
+    /// meter — a proposal. The prompt carries the deterministic rhyme
+    /// scheme; OCA grades it before and after.
+    ImproveRhyme {
+        /// Song slug, id, or title.
+        song: String,
+        /// Start byte of the selection in lyrics.md.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in lyrics.md.
+        #[arg(long)]
+        end: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Bring a lyric range onto the song's dominant meter — a proposal.
+    ImproveMeter {
+        /// Song slug, id, or title.
+        song: String,
+        /// Start byte of the selection in lyrics.md.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in lyrics.md.
+        #[arg(long)]
+        end: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Rewrite a lyric range while the song's hook (the first chorus
+    /// line) stays unchanged — a proposal.
+    PreserveHook {
+        /// Song slug, id, or title.
+        song: String,
+        /// Start byte of the selection in lyrics.md.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in lyrics.md.
+        #[arg(long)]
+        end: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Reword a lyric range keeping the exact end-rhyme scheme — a
+    /// proposal.
+    PreserveRhymeScheme {
+        /// Song slug, id, or title.
+        song: String,
+        /// Start byte of the selection in lyrics.md.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in lyrics.md.
+        #[arg(long)]
+        end: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Alternative wordings of a lyric range. A report: printed for you
+    /// to read, never written.
+    Alternatives {
+        /// Song slug, id, or title.
+        song: String,
+        /// Start byte of the selection in lyrics.md.
+        #[arg(long)]
+        start: usize,
+        /// End byte of the selection in lyrics.md.
+        #[arg(long)]
+        end: usize,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Analyze a song (theme, structure, rhyme, meter, hook, repetition).
+    /// A report: printed for you to read, never written.
+    Analyze {
+        /// Song slug, id, or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Judge a song's singability. A report: printed for you to read,
+    /// never written.
+    Singability {
+        /// Song slug, id, or title.
+        song: String,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

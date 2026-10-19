@@ -13,6 +13,7 @@ anyhow.workspace = true
 oca-ai.workspace = true
 oca-core.workspace = true
 oca-model.workspace = true
+oca-music.workspace = true
 oca-story.workspace = true
 serde_json.workspace = true
 

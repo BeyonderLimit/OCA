@@ -191,6 +191,19 @@ impl Lyrics {
         }
         Ok(Self { title, sections })
     }
+
+    /// The hook line: the first line of the first chorus section, with
+    /// chord markers stripped — the line a listener keeps, and the line
+    /// the Phase 10 preserve-hook grader protects. `None` before a chorus
+    /// exists.
+    pub fn hook_line(&self) -> Option<String> {
+        self.sections
+            .iter()
+            .find(|s| s.kind == Some(SectionKind::Chorus))
+            .and_then(|s| s.lines.first())
+            .map(|l| crate::chord::parse_line(&l.raw).0.trim().to_string())
+            .filter(|l| !l.is_empty())
+    }
 }
 
 /// `Chorus 2 {=chorus}` → (`Chorus 2`, Some("chorus")).

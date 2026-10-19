@@ -152,6 +152,96 @@ impl Grader for PreservesNamedEntities {
     }
 }
 
+/// Normalize a lyric line the way the hook comparison does: chord
+/// markers stripped, whitespace collapsed, case folded. Used by
+/// [`PreservesHook`] — chords are not the hook.
+fn normalize_lyric_line(line: &str) -> String {
+    let (text, _) = oca_music::parse_chord_line(line);
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Does any rhyme class repeat? A scheme where every letter appears once
+/// means nothing rhymes yet — there is no scheme to preserve.
+fn scheme_repeats(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .enumerate()
+        .any(|(i, l)| !l.is_empty() && labels[..i].contains(l))
+}
+
+/// The song's hook — [`oca_music::Lyrics::hook_line`], the first chorus
+/// line — still appears in the output, unchanged. This is the Phase 10
+/// preserve-hook contract; the hook's identity comes from `oca-music`,
+/// never from the model's say-so.
+#[derive(Clone, Debug, Default)]
+pub struct PreservesHook {
+    pub hook: String,
+}
+
+impl Grader for PreservesHook {
+    fn name(&self) -> &'static str {
+        "preserves-hook"
+    }
+    fn grade(&self, output: &str) -> Grade {
+        if self.hook.trim().is_empty() {
+            return verdict(
+                self.name(),
+                false,
+                "no hook to preserve — the song has no chorus yet".to_string(),
+            );
+        }
+        let hook = normalize_lyric_line(&self.hook);
+        let hits = output
+            .lines()
+            .filter(|line| normalize_lyric_line(line) == hook)
+            .count();
+        verdict(
+            self.name(),
+            hits >= 1,
+            format!("hook present {hits} time(s)"),
+        )
+    }
+}
+
+/// The output's end-rhyme scheme equals the original's — the Phase 10
+/// preserve-rhyme-scheme contract, measured by `oca-music`'s
+/// deterministic [`oca_music::rhyme_scheme`] (AGENTS: never reimplement
+/// syllable/rhyme math here — call it). An original with no rhyming pair
+/// fails honestly: an all-distinct scheme would pass vacuously.
+#[derive(Clone, Debug, Default)]
+pub struct PreservesRhymeScheme {
+    /// The original selection's scheme, from [`oca_music::score_lines`].
+    pub scheme: Vec<String>,
+    /// The language the phonetics run under (song/project default).
+    pub language: String,
+}
+
+impl Grader for PreservesRhymeScheme {
+    fn name(&self) -> &'static str {
+        "preserves-rhyme-scheme"
+    }
+    fn grade(&self, output: &str) -> Grade {
+        if !scheme_repeats(&self.scheme) {
+            return verdict(
+                self.name(),
+                false,
+                "the original has no measurable rhymes — there is no scheme to preserve"
+                    .to_string(),
+            );
+        }
+        let lines: Vec<String> = output.lines().map(str::to_string).collect();
+        let got = oca_music::score_lines(&lines, &self.language).rhyme_scheme;
+        verdict(
+            self.name(),
+            got == self.scheme,
+            format!("scheme {} (want {})", got.join(" "), self.scheme.join(" ")),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +303,46 @@ mod tests {
             fail.detail.contains("Elena") && fail.detail.contains("Marcus"),
             "{fail}"
         );
+    }
+
+    #[test]
+    fn hook_grader_needs_a_real_hook_and_a_verbatim_line() {
+        let grader = PreservesHook {
+            hook: "Keep the light on".into(),
+        };
+        assert!(grader.grade("Keep the light on\nthe kettle hums").passed);
+        assert!(
+            grader.grade("[G]Keep the light on\nthe kettle hums").passed,
+            "chords are not the hook"
+        );
+        let fail = grader.grade("Hold the lamp up\nthe kettle hums");
+        assert!(!fail.passed);
+        assert!(fail.detail.contains("0 time"), "{fail}");
+        let none = PreservesHook::default().grade("anything");
+        assert!(!none.passed, "{none}");
+    }
+
+    #[test]
+    fn rhyme_scheme_grader_compares_deterministic_schemes() {
+        let grader = PreservesRhymeScheme {
+            scheme: vec!["a".into(), "a".into()],
+            language: "en".into(),
+        };
+        assert!(
+            grader
+                .grade("the dark keeps score\nand I will keep it till the door")
+                .passed
+        );
+        let fail = grader.grade("rows of light\nand quiet sand");
+        assert!(!fail.passed, "{fail}");
+        assert!(fail.detail.contains("want a a"), "{fail}");
+        // An original with no rhyming pair: nothing to preserve — an
+        // all-distinct scheme must not pass vacuously.
+        let vacuous = PreservesRhymeScheme {
+            scheme: vec!["a".into(), "b".into()],
+            language: "en".into(),
+        }
+        .grade("anything at all\nwith two lines");
+        assert!(!vacuous.passed, "{vacuous}");
     }
 }

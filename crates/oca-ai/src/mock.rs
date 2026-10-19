@@ -44,6 +44,13 @@ pub struct Script {
     pub then: Vec<String>,
 }
 
+/// Split canned text into streamable tokens at whitespace boundaries.
+fn tokens(text: &str) -> Vec<String> {
+    text.split_inclusive(char::is_whitespace)
+        .map(str::to_string)
+        .collect()
+}
+
 impl Default for MockModel {
     fn default() -> Self {
         Self::new()
@@ -93,50 +100,138 @@ impl MockModel {
     /// answers with output that satisfies that operation's contract
     /// (valid JSON for the schema ops).
     pub fn story_defaults() -> Self {
-        fn tokens(text: &str) -> Vec<String> {
-            text.split_inclusive(char::is_whitespace)
-                .map(str::to_string)
-                .collect()
-        }
-        Self::new().with_scripts(vec![
-            Script {
-                find: "Operation: continue_scene".into(),
-                then: tokens(
-                    " The storm broke over the harbor before anyone could reach the boats.",
-                ),
-            },
-            Script {
-                find: "Operation: rewrite_selection".into(),
-                then: tokens("Elena read the letter twice; Marcus waited by the door."),
-            },
-            Script {
-                find: "Operation: summarize_chapter".into(),
-                then: tokens(
-                    "Elena receives a letter that names no sender. Marcus claims he \
+        Self::new().with_scripts(story_scripts())
+    }
+
+    /// The canned model every music-AI test runs against (Phase 10):
+    /// recognizes each operation by its `Operation:` line and answers
+    /// with output that satisfies that operation's contract — real end
+    /// rhymes for the scored rewrites, valid JSON for the schema ops.
+    pub fn music_defaults() -> Self {
+        Self::new().with_scripts(music_scripts())
+    }
+
+    /// Every canned script, story and music — what `[ai] mock = true`
+    /// boots (`oca_ai::bootstrap`), so the CLI/TUI run every operation
+    /// offline with one scripted model.
+    pub fn ai_defaults() -> Self {
+        Self::new().with_scripts([story_scripts(), music_scripts()].concat())
+    }
+}
+
+/// The Phase 9 story scripts — what [`MockModel::story_defaults`] serves.
+fn story_scripts() -> Vec<Script> {
+    vec![
+        Script {
+            find: "Operation: continue_scene".into(),
+            then: tokens(" The storm broke over the harbor before anyone could reach the boats."),
+        },
+        Script {
+            find: "Operation: rewrite_selection".into(),
+            then: tokens("Elena read the letter twice; Marcus waited by the door."),
+        },
+        Script {
+            find: "Operation: summarize_chapter".into(),
+            then: tokens(
+                "Elena receives a letter that names no sender. Marcus claims he \
                      found it in the archive; she does not believe him. They argue, \
                      and she hides the letter inside the hall.",
-                ),
-            },
-            Script {
-                find: "Operation: generate_outline".into(),
-                then: tokens(
-                    "{\"sections\":[{\"title\":\"Act I — The Letter\",\"beats\":[\
+            ),
+        },
+        Script {
+            find: "Operation: generate_outline".into(),
+            then: tokens(
+                "{\"sections\":[{\"title\":\"Act I — The Letter\",\"beats\":[\
                      \"Elena receives the letter\",\"Marcus lies about the archive\",\
                      \"The elders convene at the hall\"]}]}",
-                ),
-            },
-            Script {
-                find: "Operation: review_chapter".into(),
-                then: tokens(
-                    "{\"issues\":[{\"type\":\"timeline\",\"severity\":\"warning\",\
+            ),
+        },
+        Script {
+            find: "Operation: review_chapter".into(),
+            then: tokens(
+                "{\"issues\":[{\"type\":\"timeline\",\"severity\":\"warning\",\
                      \"location\":\"paragraph 2\",\"explanation\":\"The letter is \
                      said to arrive after market day, yet the market scene already \
                      references its contents.\"}]}",
-                ),
-            },
-        ])
-    }
+            ),
+        },
+    ]
+}
 
+/// The Phase 10 music scripts — what [`MockModel::music_defaults`] serves.
+fn music_scripts() -> Vec<Script> {
+    vec![
+        Script {
+            find: "Operation: song_concept".into(),
+            then: tokens(
+                "The song stays in one room with the sea outside: a harbor-window \
+                     lamp that outlasts the night. Titles: \"Kept Light\", \"Harbor \
+                     Almanac\", \"Lamp Against the Tide\". Themes: waiting, devotion, \
+                     return.",
+            ),
+        },
+        Script {
+            find: "Operation: song_structure".into(),
+            then: tokens("intro\nverse\nchorus\nverse\nchorus\nbridge\nchorus\noutro"),
+        },
+        Script {
+            find: "Operation: generate_section".into(),
+            then: tokens("The gulls turn over the black water\nand the cold comes in like a bell"),
+        },
+        Script {
+            find: "Operation: rewrite_lyrics".into(),
+            then: tokens(
+                "The ferry lamps go out in rows\nthe harbor keeps its slow repose\n\
+                     I set the kettle by the door\nand wait for footsteps on the shore",
+            ),
+        },
+        Script {
+            find: "Operation: improve_rhyme".into(),
+            then: tokens("The dark keeps score\nand I will keep the light until the door"),
+        },
+        Script {
+            find: "Operation: improve_meter".into(),
+            then: tokens(
+                "The ferry lamps go out in rows\nthe harbor keeps its slow repose\n\
+                     I set the kettle by the door\nand wait for footsteps on the shore",
+            ),
+        },
+        Script {
+            find: "Operation: preserve_hook".into(),
+            then: tokens("Keep the light on\nthe winter keeps its own long song"),
+        },
+        Script {
+            find: "Operation: preserve_rhyme_scheme".into(),
+            then: tokens("The dark keeps score\nand I will keep the light until the door"),
+        },
+        Script {
+            find: "Operation: alternatives".into(),
+            then: tokens(
+                "{\"alternatives\":[\"The ferry lamps go out in rows\",\
+                     \"Low water hums a patient blues\",\"A window keeps its small \
+                     repose\"]}",
+            ),
+        },
+        Script {
+            find: "Operation: analyze_song".into(),
+            then: tokens(
+                "{\"observations\":[{\"area\":\"structure\",\"note\":\"The chorus \
+                     carries the song's only repeated image; the verses walk toward \
+                     it.\"},{\"area\":\"hook\",\"note\":\"The hook opens the chorus, \
+                     where a listener expects it.\"}]}",
+            ),
+        },
+        Script {
+            find: "Operation: check_singability".into(),
+            then: tokens(
+                "{\"verdict\":\"Singable — every line sits in a comfortable 6–9 \
+                     syllable band and the hook is easy to hold.\",\"problems\":[]}",
+            ),
+        },
+    ]
+}
+
+impl MockModel {
     pub fn with_delay(mut self, ms: u64) -> Self {
         self.delay = Duration::from_millis(ms);
         self
