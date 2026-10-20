@@ -42,7 +42,7 @@ fn eval_continue_scene() {
     let mut core = story_project(tmp.path()).unwrap();
     let ai = mock_ai();
 
-    let prepared = prepare_continue_scene(&core, "1", scene_end(), DEFAULT_BUDGET).unwrap();
+    let prepared = prepare_continue_scene(&core, "1", scene_end(), DEFAULT_BUDGET, None).unwrap();
     let grade = NonEmpty.grade(&raw_generation(&ai, &prepared.request));
     assert!(grade.passed, "{grade}");
 

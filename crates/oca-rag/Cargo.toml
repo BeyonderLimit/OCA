@@ -1,0 +1,28 @@
+[package]
+name = "oca-rag"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Retrieval pipeline: import, chunk, embed, vector index, hybrid search"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+oca-ai.workspace = true
+oca-core.workspace = true
+oca-markdown.workspace = true
+oca-model.workspace = true
+oca-storage.workspace = true
+quick-xml = "0.42"
+rusqlite.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+zip = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

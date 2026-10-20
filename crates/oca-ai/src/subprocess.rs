@@ -30,9 +30,9 @@ pub struct LlamaCppSubprocess {
 }
 
 #[derive(Clone)]
-struct Endpoint {
-    port: u16,
-    api_key: String,
+pub(crate) struct Endpoint {
+    pub(crate) port: u16,
+    pub(crate) api_key: String,
 }
 
 impl LlamaCppSubprocess {
@@ -269,7 +269,7 @@ impl LlamaCppSubprocess {
 }
 
 /// One `/health` probe — connect, GET, look for a 200 status line.
-fn health_ok(port: u16) -> bool {
+pub(crate) fn health_ok(port: u16) -> bool {
     let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) else {
         return false;
     };
@@ -408,14 +408,14 @@ fn file_stem(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "model".into())
 }
 
-fn free_port() -> Result<u16> {
+pub(crate) fn free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("allocate a loopback port")?;
     Ok(listener.local_addr()?.port())
 }
 
 /// 32 random bytes, hex — the per-session API key (A7). Time-fallback only
 /// if the OS entropy source is unavailable.
-fn random_key() -> String {
+pub(crate) fn random_key() -> String {
     let mut bytes = [0u8; 32];
     if getrandom::fill(&mut bytes).is_err() {
         let nanos = std::time::SystemTime::now()
@@ -433,14 +433,14 @@ fn random_key() -> String {
     out
 }
 
-fn log_path() -> std::path::PathBuf {
+pub(crate) fn log_path() -> std::path::PathBuf {
     default_oca_dir().join("logs").join("llama-server.log")
 }
 
 /// Runtime logs go to `~/.oca/logs/llama-server.log` (or are dropped — the
 /// TUI's stderr stays silent either way). llama-server does not echo
 /// prompts into its logs, so the content gate (A7) holds by default.
-fn runtime_log() -> Stdio {
+pub(crate) fn runtime_log() -> Stdio {
     let path = log_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -465,6 +465,10 @@ fn runtime_log() -> Stdio {
 #[allow(dead_code)]
 pub mod fake_server {
     use super::*;
+    use crate::embedder::deterministic_embedding;
+
+    /// Dimension the fake embeddings answer with (mirrors `MockEmbedder`).
+    pub const EMBED_DIM: usize = crate::embedder::MOCK_EMBED_DIM;
 
     /// Accept connections forever; stream `tokens` chunks `delay` apart,
     /// then `[DONE]`.
@@ -479,16 +483,54 @@ pub mod fake_server {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut request_line = String::new();
         reader.read_line(&mut request_line)?;
+        let mut headers = String::new();
+        let mut content_length = 0usize;
         loop {
             let mut header = String::new();
             if reader.read_line(&mut header)? == 0 || header == "\r\n" || header == "\n" {
                 break;
             }
+            if let Some(len) = header
+                .to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|len| len.trim())
+            {
+                content_length = len.parse().unwrap_or(0);
+            }
+            headers.push_str(&header);
         }
+        let _ = headers;
         if request_line.starts_with("GET /health") {
             stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
             )?;
+            return Ok(());
+        }
+        if request_line.starts_with("POST /v1/embeddings") {
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body)?;
+            let value: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            let empty = Vec::new();
+            let inputs = value["input"].as_array().unwrap_or(&empty);
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, input)| {
+                    let text = input.as_str().unwrap_or_default();
+                    json!({
+                        "object": "embedding",
+                        "index": i,
+                        "embedding": deterministic_embedding(text, EMBED_DIM),
+                    })
+                })
+                .collect();
+            let payload = json!({"object": "list", "data": data}).to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(payload.as_bytes())?;
             return Ok(());
         }
         if request_line.starts_with("POST /v1/chat/completions") {

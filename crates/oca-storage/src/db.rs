@@ -154,6 +154,29 @@ CREATE TABLE annotations(
   id TEXT,
   body TEXT
 );
+"),
+    // Phase 11 (RAG): chunk cache for the embedding pipeline. Rows are
+    // derived from the Markdown documents above — delete them (or the DB)
+    // and `oca reindex` rebuilds everything (rule 2). The `vec0` vector
+    // table itself is created by `oca-rag` with the embedding model's
+    // dimension, which no static migration can know.
+    (2, "rag index", "
+CREATE TABLE rag_chunks(
+  chunk_rowid INTEGER PRIMARY KEY,
+  rel TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  heading TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL,
+  content_checksum TEXT NOT NULL,
+  embed_model TEXT NOT NULL,
+  mtime_ns INTEGER NOT NULL,
+  UNIQUE(rel, idx)
+);
+CREATE INDEX rag_chunks_rel ON rag_chunks(rel);
+CREATE TABLE rag_meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 ")];
 
 /// One search hit (FTS or tag query).
@@ -225,6 +248,7 @@ impl Db {
     /// corrupt or unreadable DB is deleted and recreated — the manuscript
     /// never depends on this file.
     pub fn open(root: &Path) -> Result<Db> {
+        register_vec_extension();
         let path = root.join(DB_REL);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -338,6 +362,31 @@ impl Db {
                 title: row.get(3)?,
                 snippet: row.get::<_, String>(4).unwrap_or_default(),
             })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The live connection — the RAG index (Phase 11) reads and writes its
+    /// `rag_*` tables through this; SQLite serializes concurrent access.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Every indexed Markdown document as `(rel, body, mtime_ns)` — the
+    /// RAG chunker iterates this (reference-library files included once
+    /// imported). Bodies carry the frontmatter stripped, exactly what the
+    /// FTS index sees.
+    pub fn markdown_docs(&self) -> Result<Vec<(PathBuf, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rel, body, mtime_ns FROM documents \
+             WHERE rel LIKE '%.md' ORDER BY rel",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -472,6 +521,32 @@ fn end_of(id: String, kind: String, rel: String, title: String) -> LinkEnd {
         rel: PathBuf::from(rel),
         title,
     }
+}
+
+/// `sqlite-vec` static-linked as an auto-extension (ADR-0020 / D8): every
+/// connection can then create and query `vec0` tables in this same file —
+/// no loadable extension, no second database. Process-global, so it
+/// registers exactly once per process.
+fn register_vec_extension() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        // The entry-point shape `sqlite3_auto_extension` registers (SQLite
+        // passes db/err/api args the extension entry ignores — hence the
+        // transmute from `sqlite_vec::sqlite3_vec_init`'s nullary extern
+        // "C" fn).
+        type SqliteInit = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(
+                std::mem::transmute::<*const (), SqliteInit>(
+                    sqlite_vec::sqlite3_vec_init as *const (),
+                ),
+            ));
+        }
+    });
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -840,7 +915,9 @@ fn index_doc(conn: &Connection, rel: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// User-facing unit kind from the top-level directory.
+/// User-facing unit kind from the top-level directory. `library/` holds
+/// imported reference material (Phase 11) — provenance the search UI and
+/// the context builder keep visible (A8).
 fn kind_for(rel: &Path) -> &'static str {
     match rel.components().next().and_then(|c| c.as_os_str().to_str()) {
         Some("manuscript") => "chapter",
@@ -849,6 +926,7 @@ fn kind_for(rel: &Path) -> &'static str {
         Some("outline") => "outline",
         Some("music") => "lyric",
         Some("notes") => "note",
+        Some("library") => "reference",
         _ => "note",
     }
 }
@@ -1265,7 +1343,7 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(v, 1);
+            assert_eq!(v, 2);
         }
         let _again = Db::open(root).unwrap(); // no error, no duplicate rows
         let db = Db::open(root).unwrap();
@@ -1273,7 +1351,72 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
+    }
+
+    /// Phase 11: every connection OCA opens can use `vec0` tables — the
+    /// extension is registered process-wide by `Db::open` (D8: one file,
+    /// no loadable extension).
+    #[test]
+    fn vec_extension_is_available_on_opened_connections() {
+        let tmp = project();
+        let db = Db::open(tmp.path()).unwrap();
+        let version: String = db
+            .connection()
+            .query_row("SELECT vec_version()", [], |r| r.get(0))
+            .unwrap();
+        assert!(version.starts_with("v0."), "vec_version: {version}");
+    }
+
+    /// The RAG chunker's input: frontmatter-stripped bodies of every
+    /// Markdown document, in path order — reference-library files included.
+    #[test]
+    fn markdown_docs_lists_bodies_in_path_order() {
+        let tmp = project();
+        let root = tmp.path();
+        write(
+            root,
+            "manuscript/001-start.md",
+            "---\nid: ch_1\ntitle: The Start\n---\nThe letter arrived at dawn.\n",
+        );
+        write(
+            root,
+            "library/harbor-law.md",
+            "---\ntitle: Harbor Law\n---\nNo vessel leaves before the bell.\n",
+        );
+        write(root, "audio/take_1.yaml", "not markdown, ignored\n");
+        let mut db = Db::open(root).unwrap();
+        db.reindex_all(root).unwrap();
+        let docs = db.markdown_docs().unwrap();
+        let rels: Vec<String> = docs
+            .iter()
+            .map(|(rel, _, _)| rel.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rels,
+            vec!["library/harbor-law.md", "manuscript/001-start.md"]
+        );
+        assert_eq!(docs[0].1, "No vessel leaves before the bell.\n");
+        assert!(!docs[0].1.contains("title:"), "frontmatter is stripped");
+    }
+
+    /// Imported references index as their own kind (A8 provenance) — the
+    /// search UI can tell project text from untrusted library material.
+    #[test]
+    fn library_files_index_as_reference() {
+        let tmp = project();
+        let root = tmp.path();
+        write(
+            root,
+            "library/harbor-law.md",
+            "---\ntitle: Harbor Law\n---\nNo vessel leaves before the bell.\n",
+        );
+        let mut db = Db::open(root).unwrap();
+        db.reindex_all(root).unwrap();
+        let hits = db.search("harbor", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "reference");
+        assert_eq!(hits[0].rel, PathBuf::from("library/harbor-law.md"));
     }
 
     #[test]

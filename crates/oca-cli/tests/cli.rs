@@ -1625,3 +1625,146 @@ fn doctor_reports_dictation_independently_of_the_llm() {
     // The LLM side is still missing — and that's a warning, not a failure.
     assert!(stdout.contains("⚠ Models"), "got: {stdout}");
 }
+
+// ---- reference library + hybrid search (Phase 11) ------------------------
+
+/// Phase 11 exit, CLI half: with the built-in scripted model (`mock = true`
+/// covers embeddings too — no runtime, no model files), `oca import`
+/// snapshots first, copies the file into `library/` with provenance, and
+/// embeds it; hybrid search then ranks the reference for its own phrase and
+/// marks it untrusted (A8).
+#[test]
+fn phase11_import_embeds_and_hybrid_searches_with_mock_ai() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    write_ai_config(&home, "[ai]\nmock = true\n");
+
+    let source = tmp.path().join("harbor-code.md");
+    std::fs::write(
+        &source,
+        "# The Harbor Code\n\nNo vessel leaves the harbor before the bell rings twice.\n",
+    )
+    .unwrap();
+
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["import", source.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "import exits 0: {out:?}");
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("snapshot 1 created before import"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("imported"), "got: {stdout}");
+    assert!(
+        stdout.contains("library/the-harbor-code.md (markdown)"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("embedded"), "got: {stdout}");
+
+    // The copy carries provenance and is a first-class document.
+    let copied = std::fs::read_to_string(root.join("library/the-harbor-code.md")).unwrap();
+    assert!(copied.contains("source_type: markdown"), "got: {copied}");
+    assert!(copied.contains("title: The Harbor Code"), "got: {copied}");
+
+    // Hybrid search: the reference ranks for its own phrase (before any
+    // manuscript hit), labeled so nobody mistakes it for authored text.
+    let out = run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["search", "bell", "rings", "twice"],
+    );
+    assert!(out.status.success(), "search exits 0");
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("[reference]"), "got: {stdout}");
+    assert!(stdout.contains("· hybrid"), "got: {stdout}");
+    assert!(
+        stdout.contains("library/the-harbor-code.md"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("match(es)"), "got: {stdout}");
+}
+
+/// Reindexing re-embeds nothing when neither the content nor the model
+/// changed — the incremental contract at the CLI level.
+#[test]
+fn phase11_reindex_reembeds_incrementally() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    write_ai_config(&home, "[ai]\nmock = true\n");
+
+    let out = run_in(&home, tmp.path(), &root, &["reindex", "--full"]);
+    assert!(out.status.success());
+    let first = stdout_of(&out);
+    let line = first
+        .lines()
+        .find(|l| l.starts_with("embeddings: "))
+        .unwrap_or_else(|| panic!("embeddings line: {first}"));
+    let embedded: usize = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("embedded count: {line}"));
+    assert!(embedded > 0, "first full reindex embeds: {line}");
+
+    let out = run_in(&home, tmp.path(), &root, &["reindex"]);
+    assert!(out.status.success());
+    let second = stdout_of(&out);
+    let line = second
+        .lines()
+        .find(|l| l.starts_with("embeddings: "))
+        .unwrap_or_else(|| panic!("embeddings line: {second}"));
+    assert!(line.contains("0 embedded"), "nothing changed: {line}");
+    assert!(
+        line.contains(&format!("{embedded} unchanged")),
+        "got: {line}"
+    );
+}
+
+/// Embeddings are discovered with no language model anywhere — the
+/// embeddings-only mode (no generative LLM). A runtime that cannot start
+/// degrades to keyword results with one honest note, never an error.
+#[test]
+fn phase11_embeddings_without_an_llm_degrade_honestly() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+    // Embedding model present, no LLM, and a llama-server stand-in that
+    // dies instantly — loading fails, and search says so.
+    let models = home.join(".oca/models/embeddings");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("lyra-embed.gguf"), vec![0u8; 4096]).unwrap();
+    let server = home.join(".oca/standalone-llama-server");
+    std::fs::write(&server, "#!/bin/sh\nexit 1").unwrap();
+    write_ai_config(
+        &home,
+        &format!("[ai]\nllama_server = {:?}\n", server.display().to_string()),
+    );
+
+    let out = run_in(&home, tmp.path(), &root, &["search", "the", "letter"]);
+    assert!(out.status.success(), "search still exits 0: {out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "no stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("embeddings unavailable"), "got: {stdout}");
+    assert!(
+        stdout.contains("match(es)"),
+        "keyword results still land: {stdout}"
+    );
+    assert!(
+        !stdout.contains("· hybrid"),
+        "degraded, not hybrid: {stdout}"
+    );
+}

@@ -336,6 +336,111 @@ impl LanguageModel for MockModel {
     }
 }
 
+/// Embedding call counts — what incremental-reindex tests assert on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmbedCounters {
+    pub load: usize,
+    pub unload: usize,
+    /// `embed` calls (batches).
+    pub embed: usize,
+    /// Texts across every batch.
+    pub texts: usize,
+}
+
+/// The deterministic [`crate::Embedder`] every retrieval test runs against
+/// (rule 6: no test ever touches a real model): bag-of-tokens vectors that
+/// reward shared vocabulary, so honest ranking tests need no model.
+pub struct MockEmbedder {
+    dim: usize,
+    loaded: AtomicBool,
+    governor: Option<crate::ModelManager>,
+    counters: Mutex<EmbedCounters>,
+}
+
+impl Default for MockEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockEmbedder {
+    pub fn new() -> Self {
+        Self {
+            dim: crate::embedder::MOCK_EMBED_DIM,
+            loaded: AtomicBool::new(false),
+            governor: None,
+            counters: Mutex::new(EmbedCounters::default()),
+        }
+    }
+
+    /// Share the session's residency budget (A6) — same governor as the
+    /// language model and dictation.
+    pub fn with_governor(governor: crate::ModelManager) -> Self {
+        Self {
+            governor: Some(governor),
+            ..Self::new()
+        }
+    }
+
+    /// Nonstandard dimension — tests that exercise a model swap.
+    pub fn with_dim(mut self, dim: usize) -> Self {
+        self.dim = dim;
+        self
+    }
+
+    pub fn counters(&self) -> EmbedCounters {
+        *self.counters.lock().expect("mock counters")
+    }
+}
+
+impl crate::Embedder for MockEmbedder {
+    fn info(&self) -> crate::EmbedderInfo {
+        crate::EmbedderInfo {
+            name: "mock-embed".into(),
+            runtime: "mock".into(),
+        }
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
+    }
+
+    fn load(&self) -> Result<()> {
+        if let Some(governor) = &self.governor {
+            governor.claim(crate::HeavyModel::Embeddings)?;
+        }
+        self.counters.lock().expect("mock counters").load += 1;
+        self.loaded.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if !self.is_loaded() {
+            return Err(anyhow!("embedding model is not loaded — load it first"));
+        }
+        let mut counters = self.counters.lock().expect("mock counters");
+        counters.embed += 1;
+        counters.texts += texts.len();
+        Ok(texts
+            .iter()
+            .map(|t| crate::embedder::deterministic_embedding(t, self.dim))
+            .collect())
+    }
+
+    fn dim(&self) -> Option<usize> {
+        Some(self.dim)
+    }
+
+    fn unload(&self) -> Result<()> {
+        self.counters.lock().expect("mock counters").unload += 1;
+        if let Some(governor) = &self.governor {
+            governor.release(crate::HeavyModel::Embeddings);
+        }
+        self.loaded.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,6 +16,7 @@ oca-audio.workspace = true
 oca-core.workspace = true
 oca-model.workspace = true
 oca-music.workspace = true
+oca-rag.workspace = true
 oca-story.workspace = true
 ratatui.workspace = true
 ropey.workspace = true

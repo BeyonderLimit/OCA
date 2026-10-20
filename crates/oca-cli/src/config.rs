@@ -35,6 +35,8 @@ pub struct AiFileConfig {
     pub llama_server: Option<PathBuf>,
     /// Models directory (default `~/.oca/models/llm`).
     pub models_dir: Option<PathBuf>,
+    /// Embedding models directory (default `~/.oca/models/embeddings`).
+    pub embeddings_dir: Option<PathBuf>,
     /// Runtime-pack directory (default `~/.oca/runtime`).
     pub runtime_dir: Option<PathBuf>,
     /// Context window, in tokens.
@@ -98,6 +100,7 @@ impl Config {
             let ai = layer.ai;
             cfg.ai.llama_server = ai.llama_server.or(cfg.ai.llama_server);
             cfg.ai.models_dir = ai.models_dir.or(cfg.ai.models_dir);
+            cfg.ai.embeddings_dir = ai.embeddings_dir.or(cfg.ai.embeddings_dir);
             cfg.ai.runtime_dir = ai.runtime_dir.or(cfg.ai.runtime_dir);
             cfg.ai.context = ai.context.or(cfg.ai.context);
             cfg.ai.gpu_layers = ai.gpu_layers.or(cfg.ai.gpu_layers);
@@ -116,6 +119,7 @@ impl Config {
     pub fn bootstrap_options(&self) -> oca_ai::BootstrapOptions {
         oca_ai::BootstrapOptions {
             models_dir: self.ai.models_dir.clone(),
+            embeddings_dir: self.ai.embeddings_dir.clone(),
             runtime_dir: self.ai.runtime_dir.clone(),
             llama_server: self.ai.llama_server.clone(),
             context: self.ai.context,

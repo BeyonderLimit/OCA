@@ -25,6 +25,7 @@ oca-core.workspace = true
 oca-markdown.workspace = true
 oca-model.workspace = true
 oca-music.workspace = true
+oca-rag.workspace = true
 oca-storage.workspace = true
 oca-story.workspace = true
 oca-tui.workspace = true

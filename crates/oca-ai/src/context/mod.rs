@@ -22,7 +22,7 @@ mod retriever;
 use serde::{Deserialize, Serialize};
 
 pub use prompt::{CHARS_PER_TOKEN, Prompt, PromptBuilder, SYSTEM_PREAMBLE, estimate_tokens};
-pub use retriever::Retriever;
+pub use retriever::{HybridSearch, RetrievedDoc, Retriever};
 
 /// Where a context block came from — recorded in every proposal's manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

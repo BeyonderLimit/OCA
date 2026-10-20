@@ -27,12 +27,13 @@ pub fn dispatch(cmd: Command, home: Option<&Path>, cfg: &Config) -> Result<u8> {
         Command::Proposal { cmd } => proposal(cmd),
         Command::Song { cmd } => song(cmd),
         Command::Audio { cmd } => audio(cmd),
-        Command::Reindex { full, project } => reindex(full, project.as_deref()),
+        Command::Reindex { full, project } => reindex(full, project.as_deref(), cfg),
         Command::Search {
             query,
             limit,
             project,
-        } => search(&query.join(" "), limit, project.as_deref()),
+        } => search(&query.join(" "), limit, project.as_deref(), cfg),
+        Command::Import { paths, project } => import(&paths, project.as_deref(), cfg),
         Command::Tag { cmd } => tag(cmd),
         Command::Tags { project } => tags(project.as_deref()),
         Command::Links { target, project } => links(&target, project.as_deref()),
@@ -203,7 +204,7 @@ fn open_tui(project: Option<&str>, cfg: &Config) -> Result<u8> {
         .as_ref()
         .map(|ai| ai.governor())
         .unwrap_or_else(oca_ai::ModelManager::new);
-    let dictation = match oca_ai::bootstrap_dictation(&opts, governor) {
+    let dictation = match oca_ai::bootstrap_dictation(&opts, governor.clone()) {
         Ok(dictation) => dictation,
         Err(err) => {
             tracing::warn!("dictation discovery failed: {err:#}");
@@ -219,7 +220,22 @@ fn open_tui(project: Option<&str>, cfg: &Config) -> Result<u8> {
             },
         )) as Arc<dyn oca_audio::Transcriber>
     });
-    oca_tui::run(&mut core, ai, transcriber)?;
+    // Phase 11: embeddings ride the same residency policy (A6); when they
+    // exist, prompt context can draw on the hybrid index through the
+    // Retriever seam, and the search panel fuses vectors with keywords.
+    let embedder = match oca_ai::bootstrap_embeddings(&opts, governor) {
+        Ok(embedder) => embedder,
+        Err(err) => {
+            tracing::warn!("embedding discovery failed: {err:#}");
+            None
+        }
+    };
+    if let Some(ai) = ai.as_ref()
+        && let Some(embedder) = embedder.as_ref()
+    {
+        ai.set_search(Arc::new(oca_rag::Rag::new(Some(embedder.clone()))));
+    }
+    oca_tui::run(&mut core, ai, transcriber, embedder)?;
     Ok(0)
 }
 
@@ -595,7 +611,18 @@ fn ai(cmd: AiCommand, cfg: &Config) -> Result<u8> {
                     core.read_document(&rel)?.body().len()
                 }
             };
-            oca_ai::prepare_continue_scene(&core, &chapter, at, budget)?
+            // Phase 11: draw on the hybrid index when embeddings are
+            // installed. Loading is best-effort — the language model
+            // already holds the residency slot (A6), so this degrades to
+            // keywords rather than fighting for RAM.
+            if let Ok(Some(embedder)) = oca_ai::bootstrap_embeddings(&opts, facade.governor()) {
+                let rag = oca_rag::Rag::new(Some(embedder));
+                if rag.load().is_ok() {
+                    facade.set_search(Arc::new(rag));
+                }
+            }
+            let wired = facade.search();
+            oca_ai::prepare_continue_scene(&core, &chapter, at, budget, wired.as_deref())?
         }
         AiCommand::Rewrite {
             chapter,
@@ -1052,7 +1079,7 @@ fn print_takes(takes: &[oca_audio::Take]) {
 /// `oca reindex` — the DB is derived state; this rebuilds it from the files.
 /// Default is the incremental reconcile (only changed files are reparsed);
 /// `--full` forces a from-scratch rebuild.
-fn reindex(full: bool, project: Option<&Path>) -> Result<u8> {
+fn reindex(full: bool, project: Option<&Path>, cfg: &Config) -> Result<u8> {
     let root = find_project(project)?;
     let mut core = open_core(&root)?;
     let started = std::time::Instant::now();
@@ -1075,33 +1102,115 @@ fn reindex(full: bool, project: Option<&Path>) -> Result<u8> {
             t.documents, t.units, t.tags, t.links, t.takes, t.songs, t.characters, t.events
         );
     }
+    // Phase 11: the vector index rebuilds from the same files, in the same
+    // cache DB — incremental unless the content or the model changed.
+    embed_sync(&core, cfg);
     Ok(0)
 }
 
-fn search(query: &str, limit: usize, project: Option<&Path>) -> Result<u8> {
+/// Embed + vector-sync the cache when an embedding model is installed
+/// (Phase 11). No model = one honest line, never an error (rule 3).
+fn embed_sync(core: &Core, cfg: &Config) {
+    let opts = cfg.bootstrap_options();
+    match oca_ai::bootstrap_embeddings(&opts, oca_ai::ModelManager::new()) {
+        Ok(Some(embedder)) => match oca_rag::sync(core, embedder.as_ref()) {
+            Ok(stats) => println!(
+                "embeddings: {} embedded, {} unchanged, {} removed — {} chunk(s) indexed",
+                stats.embedded, stats.unchanged, stats.removed, stats.chunks
+            ),
+            Err(err) => println!("embeddings: sync failed: {err:#}"),
+        },
+        Ok(None) => println!("embeddings: no embedding model installed — keyword index only"),
+        Err(err) => println!("embeddings: discovery failed: {err:#}"),
+    }
+}
+
+/// `oca import <file>...`: copy Markdown / text / EPUB into `library/`
+/// with provenance frontmatter (A8), then index + embed. Snapshot first,
+/// like every other bulk write — the pre-import state stays restorable.
+fn import(paths: &[PathBuf], project: Option<&Path>, cfg: &Config) -> Result<u8> {
+    if paths.is_empty() {
+        bail!("nothing to import — usage: oca import <file>...");
+    }
+    let root = find_project(project)?;
+    let mut core = open_core(&root)?;
+    if core.is_read_only() {
+        bail!(
+            "project is read-only: {}",
+            core.read_only_reason().unwrap_or_default()
+        );
+    }
+    let events = core.execute(CoreCommand::SnapshotCreate {
+        label: Some("before import".into()),
+    })?;
+    if let Some(Event::SnapshotCreated { n, .. }) = events.first() {
+        println!("snapshot {n} created before import");
+    }
+    for path in paths {
+        let imported = oca_rag::import_file(&root, path)?;
+        println!(
+            "imported {} → {} ({})",
+            path.display(),
+            imported.rel.display(),
+            imported.source_type
+        );
+    }
+    core.reindex()?;
+    embed_sync(&core, cfg);
+    Ok(0)
+}
+
+fn search(query: &str, limit: usize, project: Option<&Path>, cfg: &Config) -> Result<u8> {
     let query = query.trim();
     if query.is_empty() {
         bail!("nothing to search for — usage: oca search <words>");
     }
     let root = find_project(project)?;
     let core = open_core(&root)?;
-    let hits = core.search(query, limit)?;
+    // Hybrid when an embedding model is installed (Phase 11); keywords
+    // alone when it isn't — searching never requires a model (rule 3).
+    let opts = cfg.bootstrap_options();
+    let embedder = match oca_ai::bootstrap_embeddings(&opts, oca_ai::ModelManager::new()) {
+        Ok(embedder) => embedder,
+        Err(err) => {
+            tracing::warn!("embedding discovery failed: {err:#}");
+            None
+        }
+    };
+    if let Some(embedder) = &embedder
+        && let Err(err) = embedder.load()
+    {
+        // A resident model elsewhere is an explicit swap (A6); a failed
+        // load degrades to keywords with one honest line.
+        println!("note: embeddings unavailable ({err:#}); showing keyword results");
+    }
+    let ready = embedder.as_deref().filter(|e| e.is_loaded());
+    let hits = oca_rag::hybrid_search(&core, ready, query, limit)?;
     if hits.is_empty() {
         println!("no matches for \"{query}\"");
         return Ok(0);
     }
     for hit in &hits {
         println!(
-            "{:<9} {:<26} {}",
+            "{:<9} {:<26} {}{}",
             hit.kind,
             ellipsize(&hit.title, 26),
-            hit.rel.display()
+            hit.rel.display(),
+            if hit.untrusted { "  [reference]" } else { "" }
         );
         if !hit.snippet.is_empty() {
             println!("          {}", hit.snippet.replace('\n', " "));
         }
     }
-    println!("{} match(es)", hits.len());
+    println!(
+        "{} match(es){}",
+        hits.len(),
+        if hits.iter().any(|h| h.semantic.is_some()) {
+            " · hybrid"
+        } else {
+            ""
+        }
+    );
     Ok(0)
 }
 

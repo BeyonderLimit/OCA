@@ -110,6 +110,18 @@ pub enum Command {
         project: Option<PathBuf>,
     },
 
+    /// Import a reference file into the project's `library/` — Markdown,
+    /// plain text, or EPUB becomes a provenance-carrying document (A8:
+    /// imported material is untrusted context), then gets indexed and, when
+    /// an embedding model is installed, embedded for hybrid search.
+    Import {
+        /// Files to import (Markdown `.md`, plain text `.txt`, EPUB `.epub`).
+        paths: Vec<PathBuf>,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
     /// Read or edit a document's tags (`namespace:value`, e.g.
     /// `character:elena`).
     Tag {

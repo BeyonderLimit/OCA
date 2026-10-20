@@ -18,6 +18,30 @@ use super::{
 /// Read-side access to everything the context engine quotes.
 pub struct Retriever<'c> {
     core: &'c Core,
+    hybrid: Option<&'c dyn HybridSearch>,
+}
+
+/// One hybrid retrieval hit (Phase 11): a document the fused FTS ∥ vector
+/// search ranked for the query, with the provenance the context builder
+/// needs to keep imported material untrusted (A8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetrievedDoc {
+    /// Project-relative path (`library/…` for imported references).
+    pub rel: String,
+    pub title: String,
+    pub snippet: String,
+    /// Imported reference material — quoted data, never instructions (A8).
+    pub untrusted: bool,
+    /// Fusion score (higher = closer match).
+    pub score: f32,
+}
+
+/// The Phase 11 feed into the Retriever: frontends inject `oca-rag`'s
+/// hybrid search (FTS ∥ vector → rerank → dedup) through this seam. `oca-ai`
+/// never depends on `oca-rag` — the composition root wires it (rule 8:
+/// the TUI/CLI hold zero retrieval logic).
+pub trait HybridSearch: Send + Sync {
+    fn search(&self, core: &Core, query: &str, limit: usize) -> Result<Vec<RetrievedDoc>>;
 }
 
 fn to_ref(c: &Chapter) -> ChapterRef {
@@ -30,7 +54,13 @@ fn to_ref(c: &Chapter) -> ChapterRef {
 
 impl<'c> Retriever<'c> {
     pub fn new(core: &'c Core) -> Self {
-        Self { core }
+        Self { core, hybrid: None }
+    }
+
+    /// A retriever whose [`Retriever::search`] draws on the injected hybrid
+    /// search (Phase 11); `None` keeps the plain Phase 5 keyword path.
+    pub fn with_search(core: &'c Core, hybrid: Option<&'c dyn HybridSearch>) -> Self {
+        Self { core, hybrid }
     }
 
     /// Whole-project view: title, language, and the chapter list.
@@ -203,9 +233,27 @@ impl<'c> Retriever<'c> {
         })
     }
 
-    /// Phase 5 search results as untrusted blocks — searched material is
-    /// quoted data, never instructions (A8).
+    /// Search results as untrusted blocks — searched material is quoted
+    /// data, never instructions (A8). With a hybrid search wired (Phase
+    /// 11), the fused FTS ∥ vector ranking feeds this instead of plain
+    /// keyword search; imported references stay untrusted either way.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<ContextItem>> {
+        if let Some(hybrid) = self.hybrid {
+            return Ok(hybrid
+                .search(self.core, query, limit)?
+                .into_iter()
+                .map(|doc| {
+                    let mut item = ContextItem::trusted(
+                        "search",
+                        doc.rel,
+                        format!("{} — {}", doc.title, doc.snippet),
+                        PRIORITY_BACKGROUND,
+                    );
+                    item.untrusted = doc.untrusted;
+                    item
+                })
+                .collect());
+        }
         Ok(self
             .core
             .search(query, limit)?

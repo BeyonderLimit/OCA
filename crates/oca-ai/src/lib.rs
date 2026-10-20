@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 
+mod embedder;
 mod hardware;
 mod mock;
 mod packs;
@@ -36,12 +37,16 @@ pub mod operations;
 
 pub use context::{
     AlbumContext, ArtistContext, ChapterContext, ChapterRef, CharacterContext, ContextItem,
-    IntoContext, ManuscriptContext, PRIORITY_BACKGROUND, PRIORITY_PRIMARY, PRIORITY_SUPPORTING,
-    Prompt, PromptBuilder, Retriever, SYSTEM_PREAMBLE, SceneContext, SongContext, SongSection,
-    Source, WorldContext, WorldEntity, estimate_tokens,
+    HybridSearch, IntoContext, ManuscriptContext, PRIORITY_BACKGROUND, PRIORITY_PRIMARY,
+    PRIORITY_SUPPORTING, Prompt, PromptBuilder, RetrievedDoc, Retriever, SYSTEM_PREAMBLE,
+    SceneContext, SongContext, SongSection, Source, WorldContext, WorldEntity, estimate_tokens,
+};
+pub use embedder::{
+    Embedder, EmbedderConfig, EmbedderInfo, LlamaCppEmbedder, MOCK_EMBED_DIM,
+    deterministic_embedding,
 };
 pub use hardware::{Hardware, Tier};
-pub use mock::{MockModel, Script};
+pub use mock::{EmbedCounters, MockEmbedder, MockModel, Script};
 pub use music_ops::{
     ALTERNATIVES, ANALYZE_SONG, Alternatives, CHECK_SINGABILITY, GENERATE_SECTION, IMPROVE_METER,
     IMPROVE_RHYME, Observation, Observations, PRESERVE_HOOK, PRESERVE_RHYME_SCHEME, REWRITE_LYRICS,
@@ -355,6 +360,11 @@ pub fn default_models_dir() -> PathBuf {
     default_oca_dir().join("models").join("llm")
 }
 
+/// Embedding models live outside the project too: `~/.oca/models/embeddings`.
+pub fn default_embeddings_dir() -> PathBuf {
+    default_oca_dir().join("models").join("embeddings")
+}
+
 /// Side-loaded runtime packs live here: `~/.oca/runtime`.
 pub fn default_runtime_dir() -> PathBuf {
     default_oca_dir().join("runtime")
@@ -407,6 +417,8 @@ pub(crate) fn find_executable_in(
 #[derive(Clone, Debug, Default)]
 pub struct BootstrapOptions {
     pub models_dir: Option<PathBuf>,
+    /// Embedding models directory (default `~/.oca/models/embeddings`).
+    pub embeddings_dir: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     /// Explicit server path — beats discovery.
     pub llama_server: Option<PathBuf>,
@@ -504,6 +516,56 @@ pub fn bootstrap_dictation(
     Ok(Some(Dictation::new(config, governor)))
 }
 
+/// Build the embedding runtime if an embedding model *and* a `llama-server`
+/// are present; `None` means "no vectors available" — hybrid search falls
+/// back to keywords and nothing else changes (rule 3). Embeddings need **no
+/// generative LLM**: a project can run retrieval-augmented features with
+/// only `~/.oca/models/embeddings` populated. `governor` is the shared
+/// residency policy (A6) so embeddings and generation never fight for RAM.
+pub fn bootstrap_embeddings(
+    opts: &BootstrapOptions,
+    governor: ModelManager,
+) -> Result<Option<Arc<dyn Embedder>>> {
+    // Offline/demo path (Phase 11): the deterministic mock vectors — no
+    // runtime, no model files, deleting them cannot break anything. The
+    // mock also skips the residency governor: there is no RAM to
+    // arbitrate, and offline demos should compose hybrid search with the
+    // AI panel freely.
+    if opts.mock {
+        return Ok(Some(Arc::new(MockEmbedder::new())));
+    }
+    let runtime_dir = opts.runtime_dir.clone().unwrap_or_else(default_runtime_dir);
+    let server = match &opts.llama_server {
+        Some(explicit) if explicit.is_file() => Some(explicit.clone()),
+        Some(explicit) => {
+            tracing::warn!(path = %explicit.display(), "configured llama-server not found");
+            None
+        }
+        None => find_llama_server(&runtime_dir),
+    };
+    let Some(server_bin) = server else {
+        return Ok(None);
+    };
+    let models_dir = opts
+        .embeddings_dir
+        .clone()
+        .unwrap_or_else(default_embeddings_dir);
+    let Some(chosen) = discover_models(&models_dir)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let mut config = EmbedderConfig::new(chosen.path, server_bin);
+    if let Some(context) = opts.context {
+        config.context = context;
+    }
+    if let Some(gpu) = opts.gpu_layers {
+        config.gpu_layers = gpu;
+    }
+    if let Some(threads) = opts.threads {
+        config.threads = threads;
+    }
+    Ok(Some(Arc::new(LlamaCppEmbedder::new(config, governor))))
+}
+
 /// A fixed prompt the AI panel uses to prove the pipeline works end-to-end
 /// (Phase 7 has no AI features yet — the context engine arrives in Phase 8).
 pub fn probe_request() -> GenerationRequest {
@@ -565,6 +627,8 @@ struct AiInner {
     model: Arc<dyn LanguageModel>,
     manager: ModelManager,
     models: Vec<DiscoveredModel>,
+    /// The Phase 11 hybrid-search feed, injected by the frontend (rule 8).
+    search: Mutex<Option<Arc<dyn HybridSearch>>>,
 }
 
 impl Ai {
@@ -574,8 +638,21 @@ impl Ai {
                 model,
                 manager: ModelManager::new(),
                 models,
+                search: Mutex::new(None),
             }),
         }
+    }
+
+    /// Wire the hybrid search (Phase 11) the operations' context builds
+    /// draw on. The frontend injects `oca-rag` here; without it, prompts
+    /// fall back to plain keyword search.
+    pub fn set_search(&self, search: Arc<dyn HybridSearch>) {
+        *self.inner.search.lock().expect("search lock") = Some(search);
+    }
+
+    /// The wired hybrid search, if any.
+    pub fn search(&self) -> Option<Arc<dyn HybridSearch>> {
+        self.inner.search.lock().expect("search lock").clone()
     }
 
     /// GGUF files on disk, largest first (for the picker).

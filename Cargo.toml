@@ -12,6 +12,7 @@ members = [
     "crates/oca-versioning",
     "crates/oca-ai",
     "crates/oca-eval",
+    "crates/oca-rag",
 ]
 resolver = "2"
 
@@ -44,6 +45,7 @@ oca-core = { path = "crates/oca-core" }
 oca-eval = { path = "crates/oca-eval" }
 oca-markdown = { path = "crates/oca-markdown" }
 oca-model = { path = "crates/oca-model" }
+oca-rag = { path = "crates/oca-rag" }
 oca-storage = { path = "crates/oca-storage" }
 oca-story = { path = "crates/oca-story" }
 oca-music = { path = "crates/oca-music" }

@@ -71,7 +71,7 @@ fn mock_ai() -> Ai {
 fn continue_scene_inserts_at_the_cursor_and_restores() {
     let (_tmp, mut core, rel) = fixture();
     let at = chapter_body_end_of_first_scene(BODY);
-    let prepared = prepare_continue_scene(&core, "1", at, 4096).unwrap();
+    let prepared = prepare_continue_scene(&core, "1", at, 4096, None).unwrap();
     assert!(matches!(
         prepared.target,
         oca_ai::DraftTarget::Replace { .. }
@@ -292,4 +292,58 @@ fn operation_prompts_carry_provenance_and_budget() {
     );
     assert!(prompt.contains("Operation: summarize_chapter"), "{prompt}");
     assert!(prompt.contains("<context"), "{prompt}");
+}
+
+/// Phase 11 feed: with a hybrid search wired, `continue_scene` sees its
+/// hits as context blocks with provenance — imported references stay
+/// untrusted (A8) and quoted, never executable (rule 4 is unaffected:
+/// the model still only proposes).
+#[test]
+fn continue_scene_feeds_hybrid_hits_with_provenance() {
+    use oca_ai::{HybridSearch, RetrievedDoc};
+
+    struct StubSearch;
+    impl HybridSearch for StubSearch {
+        fn search(
+            &self,
+            _core: &Core,
+            _query: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<RetrievedDoc>> {
+            Ok(vec![RetrievedDoc {
+                rel: "library/harbor-law.md".into(),
+                title: "Harbor Law".into(),
+                snippet: "no vessel leaves the harbor before the bell".into(),
+                untrusted: true,
+                score: 0.87,
+            }])
+        }
+    }
+
+    let (_tmp, core, _) = fixture();
+    let at = chapter_body_end_of_first_scene(BODY);
+    let prepared = prepare_continue_scene(&core, "1", at, 4096, Some(&StubSearch)).unwrap();
+    assert!(
+        prepared
+            .request
+            .prompt
+            .contains("no vessel leaves the harbor before the bell"),
+        "the hybrid hit must reach the prompt"
+    );
+    assert!(
+        prepared
+            .manifest
+            .iter()
+            .any(|m| m.label == "search" && m.source == "library/harbor-law.md"),
+        "the hit carries provenance into the manifest: {:?}",
+        prepared.manifest
+    );
+
+    // Without a wired search the prompt stays exactly as before (golden
+    // parity — nothing leaks in by default).
+    let plain = prepare_continue_scene(&core, "1", at, 4096, None).unwrap();
+    assert!(
+        !plain.request.prompt.contains("harbor law"),
+        "no search, no search blocks"
+    );
 }

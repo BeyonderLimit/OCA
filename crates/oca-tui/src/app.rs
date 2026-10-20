@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use oca_ai::Ai;
+use oca_ai::{Ai, Embedder};
 use oca_audio::{
     Audio, AudioHost, Player, RecState, Recorder, Take, Transcriber, default_take_dir,
 };
@@ -347,6 +347,9 @@ pub struct App {
     /// transcription runtime, which only ever disables `t`/`c`/`p` with an
     /// explanation (rule 3: never required).
     transcriber: Option<Arc<dyn Transcriber>>,
+    /// Embeddings (Phase 11): the injected embedding seam — `None` means
+    /// no embedding model, and the search panel stays keyword-only.
+    embedder: Option<Arc<dyn Embedder>>,
     /// Last pass that reconciled the cache index with external edits.
     last_reconcile: Instant,
     last_journal: Instant,
@@ -388,6 +391,7 @@ impl App {
             ai_panel: None,
             proposal_panel: None,
             transcriber: None,
+            embedder: None,
             last_reconcile: Instant::now(),
             last_journal: Instant::now(),
             quit: false,
@@ -684,6 +688,14 @@ impl App {
         self.transcriber = Some(transcriber);
     }
 
+    /// Attach the embedding runtime built by the frontend (Phase 11).
+    /// Without it the search panel stays keyword-only — embeddings are
+    /// optional like everything model-adjacent (rule 3). Loading is lazy:
+    /// the first hybrid query spins the runtime up, not the launcher.
+    pub fn attach_embedder(&mut self, embedder: Arc<dyn Embedder>) {
+        self.embedder = Some(embedder);
+    }
+
     // ---- AI panel (Phase 7) ----------------------------------------------
 
     fn open_ai_panel(&mut self) {
@@ -928,7 +940,10 @@ impl App {
             (OpKind::Outline, _, _) => oca_ai::prepare_generate_outline(core, budget),
             (OpKind::Continue, _, Some(chapter)) => {
                 let at = self.editor.cursor();
-                oca_ai::prepare_continue_scene(core, chapter, at, budget)
+                // Phase 11 feed: whatever the hybrid search ties to this
+                // chapter reaches the prompt (references untrusted, A8).
+                let wired = self.ai.as_ref().and_then(|ai| ai.search());
+                oca_ai::prepare_continue_scene(core, chapter, at, budget, wired.as_deref())
             }
             (OpKind::Rewrite, _, Some(chapter)) => match selected {
                 Some((start, end)) => {
@@ -2017,7 +2032,10 @@ impl App {
     }
 
     /// Re-run the query (each keystroke — FTS over the cache is fast even
-    /// on a 500k-word corpus, A10).
+    /// on a 500k-word corpus, A10). With embeddings installed (Phase 11)
+    /// the vector half votes too: the runtime loads lazily on the first
+    /// query, and everything fuses through `oca-rag` (rule 8 — no
+    /// retrieval logic lives here).
     fn run_search(&mut self, core: &Core, panel: &mut SearchPanel) {
         panel.sel = 0;
         if panel.query.trim().is_empty() {
@@ -2025,10 +2043,31 @@ impl App {
             self.status = "search — type to filter, Enter opens, Esc closes".into();
             return;
         }
-        match core.search(&panel.query, 50) {
+        if let Some(embedder) = &self.embedder
+            && !embedder.is_loaded()
+            && let Err(err) = embedder.load()
+        {
+            self.status = format!("embeddings unavailable ({err:#}); keywords only");
+        }
+        let ready = self.embedder.as_deref().filter(|e| e.is_loaded());
+        match oca_rag::hybrid_search(core, ready, &panel.query, 50) {
             Ok(hits) => {
-                self.status = format!("{} match(es)", hits.len());
-                panel.hits = hits;
+                let hybrid = hits.iter().any(|h| h.semantic.is_some());
+                self.status = format!(
+                    "{} match(es){}",
+                    hits.len(),
+                    if hybrid { " · hybrid" } else { "" }
+                );
+                panel.hits = hits
+                    .into_iter()
+                    .map(|h| oca_core::Hit {
+                        kind: h.kind,
+                        ref_id: String::new(),
+                        rel: h.rel,
+                        title: h.title,
+                        snippet: h.snippet,
+                    })
+                    .collect();
             }
             Err(e) => {
                 panel.hits.clear();
@@ -4172,6 +4211,47 @@ hold on to the light
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Search"), "panel title renders");
         assert!(text.contains("chapter"), "hit kind renders");
+    }
+
+    /// Phase 11: with the embedding seam attached, the panel fuses vectors
+    /// with keywords (the status says "hybrid"); without it, keyword
+    /// results still land — embeddings never become a requirement (rule 3).
+    #[test]
+    fn search_panel_fuses_vectors_when_embeddings_are_attached() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        core.save_body(
+            &rel,
+            "The wind rose over the harbor before dawn, and the gulls went quiet.\n",
+        )
+        .unwrap();
+
+        // Keyword-only when nothing is attached.
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, ctrl('f')).unwrap();
+        for c in "wind".chars() {
+            app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
+        }
+        assert!(
+            !app.status.contains("hybrid"),
+            "keyword-only: {}",
+            app.status
+        );
+
+        // Attached: the first query loads lazily and the halves fuse.
+        let embedder = Arc::new(oca_ai::MockEmbedder::new());
+        oca_rag::sync(&core, embedder.as_ref()).unwrap();
+        app.attach_embedder(embedder);
+        for c in " again".chars() {
+            app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
+        }
+        assert!(app.status.contains("hybrid"), "fused: {}", app.status);
+        assert!(
+            app.status.contains("match(es)"),
+            "hits land: {}",
+            app.status
+        );
+        assert!(!app.search_panel.as_ref().unwrap().hits.is_empty());
     }
 
     // ---- AI panel (Phase 7) ----------------------------------------------

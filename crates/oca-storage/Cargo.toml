@@ -16,11 +16,11 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sqlite-vec = "0.1"
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-sqlite-vec = "0.1"
 tempfile = "3"
 
 [lints]

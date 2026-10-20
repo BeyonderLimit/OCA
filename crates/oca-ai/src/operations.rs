@@ -27,8 +27,8 @@ use oca_model::DocumentKind;
 use oca_story::Story;
 
 use crate::context::{
-    ChapterContext, ChapterRef, ContextItem, IntoContext, PRIORITY_BACKGROUND, PRIORITY_PRIMARY,
-    PRIORITY_SUPPORTING, PromptBuilder, Retriever,
+    ChapterContext, ChapterRef, ContextItem, HybridSearch, IntoContext, PRIORITY_BACKGROUND,
+    PRIORITY_PRIMARY, PRIORITY_SUPPORTING, PromptBuilder, Retriever,
 };
 use crate::{Ai, GenerationRequest};
 
@@ -291,6 +291,7 @@ pub fn prepare_continue_scene(
     chapter: &str,
     at: usize,
     budget: usize,
+    search: Option<&dyn HybridSearch>,
 ) -> Result<Prepared> {
     let (ctx, document) = chapter_doc(core, chapter)?;
     let body = &ctx.body;
@@ -304,7 +305,7 @@ pub fn prepare_continue_scene(
         .map(|i| i + 1)
         .or_else(|| before.starts_with("## ").then_some(0))
         .unwrap_or(0);
-    let items = vec![
+    let mut items = vec![
         ContextItem::trusted(
             "chapter",
             ctx.chapter.id.clone(),
@@ -318,6 +319,15 @@ pub fn prepare_continue_scene(
             PRIORITY_PRIMARY,
         ),
     ];
+    // Phase 11 feed: whatever the hybrid search ties to this chapter
+    // (imported references included — always untrusted, A8).
+    if let Some(hybrid) = search {
+        items.extend(
+            Retriever::with_search(core, Some(hybrid))
+                .search(&ctx.chapter.title, 3)
+                .unwrap_or_default(),
+        );
+    }
     let prompt = PromptBuilder::new(budget).build(
         &task_line(
             &CONTINUE_SCENE,
