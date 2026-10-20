@@ -412,6 +412,14 @@ impl Editor {
         self.anchor = None;
     }
 
+    /// Cursor to the end of the buffer — open-for-append: the author opens
+    /// a document to keep writing, and typing must continue the text, not
+    /// splice itself in front of the title heading.
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.buffer.len_chars();
+        self.anchor = None;
+    }
+
     /// Normalized selection, if any.
     pub fn selection(&self) -> Option<Range<usize>> {
         let a = self.anchor?;

@@ -392,9 +392,14 @@ impl App {
     pub fn new(core: &Core, audio_host: Arc<dyn AudioHost>) -> Self {
         let items = build_items(core);
         let sel = next_selectable(&items, 0, 1).unwrap_or(0);
+        let empty = !items.iter().any(|i| matches!(i, TreeItem::Doc { .. }));
         let status = if core.is_read_only() {
             core.read_only_reason()
                 .unwrap_or_else(|| "read-only".into())
+        } else if empty {
+            // A fresh project has nothing to open — say how to start,
+            // or the first keystrokes vanish into the tree.
+            "empty project — Ctrl-N creates your first chapter, then just type".into()
         } else {
             "ready — Enter opens the selected document".into()
         };
@@ -482,6 +487,9 @@ impl App {
                             .unwrap_or_default()
                     });
                 self.editor.load(&body);
+                // Open-for-append: typing continues the document instead of
+                // splicing in front of the title heading.
+                self.editor.move_to_end();
                 self.open_rel = Some(rel.clone());
                 self.dirty = false;
                 self.focus = Focus::Editor;
@@ -2449,6 +2457,7 @@ impl App {
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     self.words = entry.content.split_whitespace().count();
                     self.editor.load(&entry.content);
+                    self.editor.move_to_end();
                     self.dirty = true;
                     self.focus = Focus::Editor;
                     self.refresh_song_metrics();
@@ -3449,6 +3458,51 @@ mod tests {
         assert_eq!(app.open_rel.as_ref(), Some(&rel));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.editor.text().starts_with("# First"));
+    }
+
+    /// A brand-new project has no documents to open — the status must say
+    /// how to start, or the first keystrokes vanish into the tree.
+    #[test]
+    fn empty_project_points_at_ctrl_n() {
+        let tmp = TempDir::new().unwrap();
+        let mut core = Core::new();
+        core.execute(Command::CreateProject {
+            root: tmp.path().to_path_buf(),
+            title: "Empty".into(),
+            kind: ProjectKind::Novel,
+        })
+        .unwrap();
+        let app = App::new(&core, Arc::new(MockHost::new()));
+        assert!(
+            app.status.contains("Ctrl-N"),
+            "status tells the author how to start: {:?}",
+            app.status
+        );
+    }
+
+    /// Opening a document puts the cursor at the end: typing continues the
+    /// text instead of splicing itself in front of the title heading.
+    #[test]
+    fn opened_document_starts_at_the_end_so_typing_appends() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, rel) = project_with_chapter(&tmp);
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            app.editor.cursor(),
+            app.editor.text().chars().count(),
+            "cursor at the end after open"
+        );
+
+        for c in "Continued.".chars() {
+            app.on_key(&mut core, key(KeyCode::Char(c))).unwrap();
+        }
+        app.on_key(&mut core, ctrl('s')).unwrap();
+        let body = core.read_document(&rel).unwrap().body().to_string();
+        assert_eq!(
+            body, "# First\nContinued.",
+            "heading intact, text appended after it: {body:?}"
+        );
     }
 
     #[test]
@@ -4981,8 +5035,11 @@ hold on to the light
 
         // Select the first 7 bytes in the editor (Shift+Right from Home),
         // then run rewrite — the proposal must target exactly that range.
+        // (Open leaves the cursor on the empty line after the trailing
+        // newline — open-for-append — so step up to the content first.)
         let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
         app.focus = Focus::Editor;
+        app.on_key(&mut core, key(KeyCode::Up)).unwrap();
         app.on_key(&mut core, key(KeyCode::Home)).unwrap();
         for _ in 0..7 {
             app.on_key(&mut core, shift_right).unwrap();
