@@ -136,6 +136,16 @@ impl Index {
         self.by_id(id).map(|e| e.rel.clone())
     }
 
+    /// Every entry whose filename stem equals `key` — what users type after
+    /// seeing `created manuscript/001-the-letter.md` printed. Callers must
+    /// decide what ambiguity means (one match resolves, several do not).
+    pub fn by_stem(&self, key: &str) -> Vec<&DocEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.rel.file_stem().and_then(|s| s.to_str()) == Some(key))
+            .collect()
+    }
+
     /// Document kind directory → entries (for the TUI project tree).
     pub fn groups(&self) -> Vec<(&'static str, Vec<&DocEntry>)> {
         let order: [&str; 7] = [

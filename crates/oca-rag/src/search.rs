@@ -121,6 +121,25 @@ pub fn hybrid_search(
     if query.is_empty() {
         return Ok(Vec::new());
     }
+    // `tag:ns:value` is a metadata lookup, not prose: the keyword half
+    // answers it exactly, and a vector half would only pollute the result
+    // with lookalike text.
+    if query.starts_with("tag:") {
+        return Ok(core
+            .search(query, limit)?
+            .into_iter()
+            .map(|h| RagHit {
+                kind: h.kind,
+                untrusted: h.rel.starts_with("library/"),
+                rel: h.rel,
+                title: h.title,
+                snippet: h.snippet.replace('\n', " "),
+                score: 0.0,
+                semantic: None,
+                lexical_rank: None,
+            })
+            .collect());
+    }
     let lexical = core.search(query, (limit * 2).max(limit))?;
 
     struct Acc {

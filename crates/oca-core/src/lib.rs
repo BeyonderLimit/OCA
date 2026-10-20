@@ -327,6 +327,15 @@ impl Core {
             Command::SnapshotRestore { n } => {
                 oca_versioning::validate_n(n)?;
                 let root = self.snapshot_root("restore snapshots")?;
+                // The snapshot must exist *now*: the auto-snapshot below
+                // would otherwise inflate history by one and make
+                // `restore 1` on an empty history silently "restore" the
+                // safety copy of the current state — a no-op that reports
+                // success.
+                let holds = self.store.list(&root)?.len();
+                if n > holds {
+                    anyhow::bail!("no snapshot #{n} (history holds {holds})");
+                }
                 // Auto-snapshot first — the same hook the AI proposal
                 // apply, bulk edit, and import paths will use. If the
                 // current state cannot be saved, the restore is refused.
@@ -948,6 +957,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut core = opened_core(&tmp);
         with_chapter(&mut core, "First");
+        // Empty history: the existence check must come *before* the
+        // auto-snapshot — otherwise the safety copy would inflate history
+        // and `restore 1` would silently no-op as a "success".
+        let err = core
+            .execute(Command::SnapshotRestore { n: 1 })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no snapshot #1"), "{err}");
+        assert!(err.contains("history holds 0"), "{err}");
         core.execute(Command::SnapshotCreate { label: None })
             .unwrap();
         assert!(

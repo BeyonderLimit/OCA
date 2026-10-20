@@ -11,7 +11,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     read,
@@ -52,7 +52,10 @@ pub fn run(
     transcriber: Option<Arc<dyn oca_audio::Transcriber>>,
     embedder: Option<Arc<dyn oca_ai::Embedder>>,
 ) -> Result<()> {
-    enable_raw_mode()?;
+    enable_raw_mode().with_context(|| {
+        "cannot open the interactive editor — OCA needs a real terminal \
+         (run `oca open` from an interactive session, not a pipe or script)"
+    })?;
     let mut stdout = io::stdout();
     execute!(
         stdout,

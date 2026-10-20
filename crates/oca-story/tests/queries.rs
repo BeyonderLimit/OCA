@@ -145,6 +145,21 @@ fn chapters_containing_finds_name_and_aliases_but_not_substrings() {
 // ---- "What happened before chapter 8?" (flashback fixture, both senses) -----
 
 #[test]
+fn before_resolves_chapter_keys_by_stem_and_title_too() {
+    let (_tmp, core) = open_sample();
+    let story = Story::new(&core);
+    let by_id = story.events_before("ch_008", TimeSense::Narrative).unwrap();
+    let by_stem = story
+        .events_before("008-the-trial", TimeSense::Narrative)
+        .unwrap();
+    let by_title = story
+        .events_before("The Trial", TimeSense::Narrative)
+        .unwrap();
+    assert_eq!(event_ids(&by_stem), event_ids(&by_id), "filename stem");
+    assert_eq!(event_ids(&by_title), event_ids(&by_id), "title");
+}
+
+#[test]
 fn before_chapter_8_in_both_time_senses() {
     let (_tmp, core) = open_sample();
     let story = Story::new(&core);

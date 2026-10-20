@@ -49,6 +49,21 @@ pub struct Chapter {
     pub seq: u32,
 }
 
+/// Narrative position of a hand-authored chapter key (`at:` entries in
+/// `states:`, `chapter:` fields in events): id first, then filename stem,
+/// then title — the same tolerance `Story::chapter` offers, because these
+/// keys live in frontmatter people write by hand and the docs show
+/// filename-shaped examples.
+pub(crate) fn position_of(chs: &[Chapter], key: &str) -> Option<usize> {
+    chs.iter()
+        .position(|c| c.id == key)
+        .or_else(|| {
+            chs.iter()
+                .position(|c| c.rel.file_stem().and_then(|s| s.to_str()) == Some(key))
+        })
+        .or_else(|| chs.iter().position(|c| c.title.eq_ignore_ascii_case(key)))
+}
+
 /// "Who is Marcus?" — the authored identity plus resolved current state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
@@ -158,7 +173,12 @@ impl<'c> Story<'c> {
                     || c.title.to_lowercase() == lower
             })
             .cloned()
-            .with_context(|| format!("no character {key:?} in characters/"))
+            .with_context(|| {
+                format!(
+                    "no character {key:?} in characters/ — add characters/<slug>.md with \
+                     id: / name: / aliases: lines (the TUI's New document writes the shape)"
+                )
+            })
     }
 
     /// "Where is Elena?" — carry-forward state at `at` (any chapter key;
@@ -243,7 +263,7 @@ impl<'c> Story<'c> {
     pub fn events_before(&self, chapter: &str, sense: TimeSense) -> Result<Vec<Event>> {
         let target = self.chapter(chapter)?;
         let chs = self.chapters()?;
-        let position_of = |id: &str| chs.iter().position(|c| c.id == id);
+        let position_of = |key: &str| position_of(&chs, key);
         let mut evs = self.events()?;
         match sense {
             TimeSense::Narrative => {

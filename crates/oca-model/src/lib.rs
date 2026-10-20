@@ -5,12 +5,14 @@
 //! source of truth. Parsing produces a *view*; edits are targeted patches that
 //! never re-serialize what they didn't touch.
 
+pub mod date;
 pub mod document;
 pub mod frontmatter;
 pub mod id;
 pub mod project;
 pub mod yaml;
 
+pub use date::today_utc;
 pub use document::{Block, Document, LineRange, Section, WikiLink};
 pub use frontmatter::Frontmatter;
 pub use id::new_id;

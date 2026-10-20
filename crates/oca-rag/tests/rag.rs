@@ -93,6 +93,30 @@ fn import_sync_hybrid_query_ranks_and_dedupes() {
     assert_eq!(occurrences, 1, "deduplicated by document: {hits:?}");
 }
 
+/// `tag:` queries stay metadata lookups even when vectors can vote —
+/// lookalike prose must not pollute a tag result (regression guard: the
+/// hybrid path once let the vector half answer `tag:` queries).
+#[test]
+fn tag_queries_never_let_vectors_vote() {
+    let (_tmp, mut core) = fixture();
+    let embedder = embedder();
+    sync(&core, embedder.as_ref()).unwrap();
+    let chapter = PathBuf::from("manuscript/001-the-letter.md");
+    core.execute(Command::SetFrontmatter {
+        doc: chapter.clone(),
+        key: "tags".into(),
+        // A newline routes the write through the block (sequence) path.
+        value: "- character:elena\n".into(),
+    })
+    .unwrap();
+    core.reindex().unwrap();
+
+    let hits = hybrid_search(&core, Some(embedder.as_ref()), "tag:character:elena", 10).unwrap();
+    assert_eq!(hits.len(), 1, "only the tagged document: {hits:?}");
+    assert_eq!(hits[0].rel, chapter);
+    assert!(hits[0].semantic.is_none(), "no vector vote on metadata");
+}
+
 #[test]
 fn reembed_after_an_edit_is_incremental() {
     let (_tmp, mut core) = fixture();

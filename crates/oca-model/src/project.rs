@@ -167,11 +167,14 @@ impl ProjectMeta {
 
     /// Frontmatter template for a new document of `kind`.
     pub fn document_frontmatter(&self, kind: DocumentKind, title: &str) -> Result<Frontmatter> {
+        // The creation date is stamped once, in the file, where it can be
+        // read without trusting filesystem metadata (provenance, not logic).
+        let today = crate::date::today_utc();
         Frontmatter::create(&[
             ("id", new_id(kind.prefix()).as_str()),
             ("title", title),
             ("project_id", self.project_id().as_str()),
-            ("created", ""),
+            ("created", &today),
             ("tags", "[]"),
         ])
     }
@@ -223,5 +226,9 @@ mod tests {
             fm.get_str("project_id").as_deref(),
             Some(meta.project_id().as_str())
         );
+        // The creation date is stamped in the file, never left empty.
+        let created = fm.get_str("created").unwrap();
+        assert_eq!(created.len(), 10, "stamped date: {created}");
+        assert_ne!(created, "", "no empty placeholder");
     }
 }

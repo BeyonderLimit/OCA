@@ -166,12 +166,40 @@ impl Project {
     /// Resolve `id` (preferred) or exact title to a project-relative path.
     /// A missing or vanished hit triggers one rescan — a file renamed on disk
     /// still resolves (A2 exit criterion: external moves never break links).
+    /// A filename stem (`001-the-letter`, what the CLI just printed) resolves
+    /// when exactly one document matches; several matches name the candidates
+    /// instead of guessing.
     pub fn resolve(&mut self, key: &str) -> Result<PathBuf> {
-        if let Some(rel) = self.lookup(key) {
+        if let Some(rel) = self.lookup_id(key) {
             return Ok(rel);
         }
         self.refresh_index()?;
-        if let Some(rel) = self.lookup(key) {
+        if let Some(rel) = self.lookup_id(key) {
+            return Ok(rel);
+        }
+        // The filename stem resolves next — it lives in the filename's own
+        // space, before titles (untitled documents *fall back* to their
+        // stem as a title, which would otherwise hide a second file with
+        // the same name). One match → it; several → name them, never guess.
+        let matches: Vec<PathBuf> = self
+            .index
+            .by_stem(key)
+            .into_iter()
+            .map(|e| e.rel.clone())
+            .filter(|rel| self.root.join(rel).is_file())
+            .collect();
+        match matches.as_slice() {
+            [one] => return Ok(one.clone()),
+            [] => {}
+            many => anyhow::bail!(
+                "'{key}' matches several documents: {} — use a fuller path or the id",
+                many.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+        if let Some(rel) = self.lookup_title(key) {
             return Ok(rel);
         }
         // A literal project-relative path also resolves (typing paths in CLI).
@@ -182,15 +210,17 @@ impl Project {
         {
             return Ok(direct);
         }
-        anyhow::bail!("no document with id or title: {key}")
+        anyhow::bail!("no document with id, title, or path: {key}")
     }
 
-    fn lookup(&self, key: &str) -> Option<PathBuf> {
-        let rel = self
-            .index
-            .path_of(key)
-            .or_else(|| self.index.by_title(key).map(|e| e.rel.clone()))?;
+    fn lookup_id(&self, key: &str) -> Option<PathBuf> {
+        let rel = self.index.path_of(key)?;
         // Trust the index only while its file is still there.
+        self.root.join(&rel).is_file().then_some(rel)
+    }
+
+    fn lookup_title(&self, key: &str) -> Option<PathBuf> {
+        let rel = self.index.by_title(key)?.rel.clone();
         self.root.join(&rel).is_file().then_some(rel)
     }
 
@@ -596,5 +626,30 @@ mod tests {
             rel
         );
         assert!(p.resolve("ch_does_not_exist").is_err());
+    }
+
+    #[test]
+    fn resolve_by_filename_stem_when_unique_and_refused_when_ambiguous() {
+        let tmp = TempDir::new().unwrap();
+        let mut p = created_project(&tmp);
+        let rel = p
+            .create_document(DocumentKind::Chapter, "The Letter")
+            .unwrap();
+        // The stem users see printed ("created manuscript/001-…") resolves
+        // when it is the only document with that stem.
+        assert_eq!(p.resolve("001-the-letter").unwrap(), rel);
+        // A second document with the same stem in another group makes it
+        // ambiguous — the error names the candidates, never guesses.
+        let twin = tmp.path().join("notes/001-the-letter.md");
+        std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
+        std::fs::write(&twin, "---\nid: ch_twin\n---\n\nA twin note.\n").unwrap();
+        let err = p.resolve("001-the-letter").unwrap_err().to_string();
+        assert!(err.contains("several documents"), "{err}");
+        assert!(err.contains("manuscript/001-the-letter.md"), "{err}");
+        assert!(err.contains("notes/001-the-letter.md"), "{err}");
+        // A fuller reference still resolves, and a typo says so plainly.
+        assert_eq!(p.resolve("manuscript/001-the-letter.md").unwrap(), rel);
+        let err = p.resolve("no-such-stem").unwrap_err().to_string();
+        assert!(err.contains("id, title, or path"), "{err}");
     }
 }

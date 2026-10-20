@@ -42,7 +42,7 @@ pub(crate) fn resolve(
     chapters: &[Chapter],
     target: &Chapter,
 ) -> BTreeMap<String, String> {
-    let position_of = |id: &str| chapters.iter().position(|c| c.id == id);
+    let position_of = |key: &str| crate::position_of(chapters, key);
     let mut out = BTreeMap::new();
     let Some(target_pos) = position_of(&target.id) else {
         return out;
@@ -186,5 +186,19 @@ mod tests {
         let chs = [ch("ch_1", 1)];
         let states = [entry("ch_deleted", &[("location", "nowhere")])];
         assert!(resolve(&states, &chs, &chs[0]).is_empty());
+    }
+
+    #[test]
+    fn at_keys_accept_stems_and_titles_not_just_ids() {
+        let chs = [ch("ch_1", 1), ch("ch_2", 2)];
+        // Hand-authored keys in the style people actually write: a
+        // filename stem and a title — neither is the frontmatter id.
+        let states = [
+            entry("001", &[("location", "harbor-house")]),
+            entry("Chapter 2", &[("emotional", "resolved")]),
+        ];
+        let at_2 = resolve(&states, &chs, &chs[1]);
+        assert_eq!(at_2["location"], "harbor-house", "stem key resolves");
+        assert_eq!(at_2["emotional"], "resolved", "title key resolves");
     }
 }

@@ -52,7 +52,8 @@ pub fn collect(
         None => Check {
             ok: false,
             label: "Project directory",
-            detail: "no project here (`oca new` arrives in Phase 1)".into(),
+            detail: "no project here — `oca new <name>` creates one, or pass --project <path>"
+                .into(),
         },
     });
 
@@ -302,7 +303,7 @@ pub fn collect(
         Some(_) | None => Check {
             ok: false,
             label: "Embeddings",
-            detail: "No embedding model installed".into(),
+            detail: "no embedding model installed".into(),
         },
     });
 
@@ -354,13 +355,13 @@ mod tests {
             Check {
                 ok: false,
                 label: "Embeddings",
-                detail: "No embedding model installed".into(),
+                detail: "no embedding model installed".into(),
             },
         ];
         let out = render(&checks);
         assert!(out.starts_with("OCA Doctor\n"));
         assert!(out.contains("✓ Database\n"));
-        assert!(out.contains("⚠ Embeddings — No embedding model installed\n"));
+        assert!(out.contains("⚠ Embeddings — no embedding model installed\n"));
     }
 
     #[test]
@@ -374,7 +375,7 @@ mod tests {
         assert!(!project.ok);
         let emb = checks.iter().find(|c| c.label == "Embeddings").unwrap();
         assert!(!emb.ok);
-        assert_eq!(emb.detail, "No embedding model installed");
+        assert_eq!(emb.detail, "no embedding model installed");
     }
 
     #[test]
