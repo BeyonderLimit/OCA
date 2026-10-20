@@ -22,7 +22,7 @@ pub fn dispatch(cmd: Command, home: Option<&Path>, cfg: &Config) -> Result<u8> {
         Command::List => list_projects(home),
         Command::Open { project } => open_tui(project.as_deref(), cfg),
         Command::Chapter { cmd } => chapter(cmd),
-        Command::Story { cmd } => story(cmd),
+        Command::Story { cmd } => story(cmd, cfg),
         Command::Ai { cmd } => ai(cmd, cfg),
         Command::Proposal { cmd } => proposal(cmd),
         Command::Song { cmd } => song(cmd),
@@ -439,7 +439,7 @@ fn chapter(cmd: ChapterCommand) -> Result<u8> {
 
 // ---- story queries (Phase 2) -----------------------------------------------
 
-fn story(cmd: StoryCommand) -> Result<u8> {
+fn story(cmd: StoryCommand, cfg: &Config) -> Result<u8> {
     match cmd {
         StoryCommand::Who { character, project } => {
             let core = story_core(project.as_deref())?;
@@ -536,6 +536,99 @@ fn story(cmd: StoryCommand) -> Result<u8> {
                     .map(|c| c.title.as_str())
                     .unwrap_or("—");
                 println!("  {}  {}  {}", e.story_time, shown, e.title);
+            }
+            Ok(0)
+        }
+        StoryCommand::Check {
+            all,
+            no_passages,
+            project,
+        } => {
+            let core = story_core(project.as_deref())?;
+            let issues = oca_story::check(&core)?;
+            let ignored = oca_story::ignored_ids(&core)?;
+            let hidden = issues.iter().filter(|i| ignored.contains(&i.id)).count();
+            let visible: Vec<&oca_story::Issue> = issues
+                .iter()
+                .filter(|i| all || !ignored.contains(&i.id))
+                .collect();
+            if visible.is_empty() {
+                if hidden > 0 {
+                    println!(
+                        "no continuity issues ({hidden} ignored — `oca story check --all` shows \
+                         them)"
+                    );
+                } else {
+                    println!("no continuity issues found");
+                }
+                return Ok(0);
+            }
+            let count = |sev| visible.iter().filter(|i| i.severity == sev).count();
+            println!(
+                "continuity — {} high, {} warning(s), {} note(s)",
+                count(oca_story::Severity::Error),
+                count(oca_story::Severity::Warning),
+                count(oca_story::Severity::Info),
+            );
+            // Supporting passages when an embedding model is available —
+            // never required (rule 3), silent when absent so the report
+            // itself reads the same everywhere.
+            let ready = if no_passages {
+                None
+            } else {
+                oca_ai::bootstrap_embeddings(&cfg.bootstrap_options(), oca_ai::ModelManager::new())
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.load().ok().map(|_| e))
+            };
+            let ready = ready.as_deref().filter(|e| e.is_loaded());
+            for issue in visible {
+                println!();
+                println!(
+                    "{}  {}{}",
+                    issue.severity.label(),
+                    issue.check,
+                    if ignored.contains(&issue.id) {
+                        "  (ignored)"
+                    } else {
+                        ""
+                    }
+                );
+                println!("  {}", issue.message);
+                if !issue.refs.is_empty() {
+                    println!(
+                        "  refs: {}",
+                        issue
+                            .refs
+                            .iter()
+                            .map(|r| r.rel.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if issue.query.is_empty() || issue.severity == oca_story::Severity::Info {
+                    continue;
+                }
+                let Ok(hits) = oca_rag::hybrid_search(&core, ready, &issue.query, 3) else {
+                    continue;
+                };
+                for hit in hits
+                    .iter()
+                    .filter(|h| !issue.refs.iter().any(|r| r.rel == h.rel))
+                {
+                    println!(
+                        "  passage: {} — {}{}",
+                        ellipsize(&hit.title, 24),
+                        hit.rel.display(),
+                        if hit.untrusted { "  [reference]" } else { "" }
+                    );
+                    if !hit.snippet.is_empty() {
+                        println!("            {}", ellipsize(&hit.snippet, 100));
+                    }
+                }
+            }
+            if !all && hidden > 0 {
+                println!("\n{hidden} ignored issue(s) hidden — `oca story check --all` shows them");
             }
             Ok(0)
         }

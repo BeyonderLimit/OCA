@@ -48,6 +48,8 @@ enum Focus {
     /// The AI proposals panel (Phase 9): the list plus a side-by-side
     /// review with accept / reject / edit.
     Proposals,
+    /// The continuity panel (Phase 12): issue list plus reference triage.
+    Continuity,
 }
 
 enum TreeItem {
@@ -305,6 +307,31 @@ enum PropMode {
     },
 }
 
+/// The continuity panel (Phase 12): the issue list plus reference triage
+/// (`[View references] [Ignore] [Create note]` from the roadmap). Every
+/// detection and triage decision lives in `oca-story` (rule 8) — this
+/// collects keys and formats.
+struct ContinuityPanel {
+    /// All issues as reported, severity-sorted; filtering is done live.
+    issues: Vec<oca_story::Issue>,
+    /// Issue ids the author has ignored (`.oca/state/`, precious).
+    ignored: std::collections::BTreeSet<String>,
+    /// Selection into the *visible* list.
+    sel: usize,
+    /// Show ignored issues too (the `a` toggle).
+    show_ignored: bool,
+    mode: ContMode,
+}
+
+enum ContMode {
+    List,
+    /// "[View references]" detail: the message plus the documents it
+    /// points at, one of which Enter opens.
+    Refs {
+        sel: usize,
+    },
+}
+
 /// Present while a song's `lyrics.md` is open: the language its lyric tools
 /// run under plus the loaded phonetics. All analysis lives in `oca-music`
 /// (rule 8) — this only caches what the status bar and section jumps need.
@@ -343,6 +370,8 @@ pub struct App {
     ai_panel: Option<AiPanel>,
     /// Present while the AI proposals panel is open (Phase 9).
     proposal_panel: Option<ProposalPanel>,
+    /// Present while the continuity panel is open (Phase 12).
+    continuity_panel: Option<ContinuityPanel>,
     /// Dictation (Phase 7B): the injected whisper seam — `None` means no
     /// transcription runtime, which only ever disables `t`/`c`/`p` with an
     /// explanation (rule 3: never required).
@@ -390,6 +419,7 @@ impl App {
             ai: None,
             ai_panel: None,
             proposal_panel: None,
+            continuity_panel: None,
             transcriber: None,
             embedder: None,
             last_reconcile: Instant::now(),
@@ -1302,6 +1332,277 @@ impl App {
         self.proposal_panel = Some(panel);
     }
 
+    // ---- continuity panel (Phase 12) ----------------------------------------
+
+    /// Run the deterministic checks and open the triage list. Every
+    /// detection and triage write lives in `oca-story` (rule 8) — this only
+    /// collects keys and formats.
+    fn open_continuity_panel(&mut self, core: &Core) {
+        match oca_story::check(core) {
+            Ok(issues) => {
+                let ignored = oca_story::ignored_ids(core).unwrap_or_default();
+                let hidden = issues.iter().filter(|i| ignored.contains(&i.id)).count();
+                self.status = if issues.is_empty() {
+                    "continuity — no issues found".into()
+                } else if hidden == issues.len() {
+                    "continuity — every issue is ignored (a shows them)".into()
+                } else {
+                    format!(
+                        "continuity — {} issue(s){} · Enter refs, i ignore, n note",
+                        issues.len() - hidden,
+                        if hidden > 0 {
+                            format!(", {hidden} ignored")
+                        } else {
+                            String::new()
+                        }
+                    )
+                };
+                self.continuity_panel = Some(ContinuityPanel {
+                    issues,
+                    ignored,
+                    sel: 0,
+                    show_ignored: false,
+                    mode: ContMode::List,
+                });
+                self.focus = Focus::Continuity;
+            }
+            Err(e) => self.status = format!("continuity check failed: {e:#}"),
+        }
+    }
+
+    /// Indices into `panel.issues` the list shows, re-derived per key so
+    /// the ignore toggle and the `a` filter stay live.
+    fn visible_issues(panel: &ContinuityPanel) -> Vec<usize> {
+        panel
+            .issues
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| panel.show_ignored || !panel.ignored.contains(&i.id))
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// Re-clamp the selection after the visible list shrank.
+    fn clamp_continuity_sel(panel: &mut ContinuityPanel) {
+        let vlen = Self::visible_issues(panel).len();
+        panel.sel = panel.sel.min(vlen.saturating_sub(1));
+    }
+
+    fn continuity_key(&mut self, core: &mut Core, key: KeyEvent) {
+        let Some(mut panel) = self.continuity_panel.take() else {
+            return;
+        };
+        let visible = Self::visible_issues(&panel);
+
+        // The references view: pick a document an issue points at.
+        if let ContMode::Refs { sel } = &mut panel.mode {
+            match key.code {
+                KeyCode::Esc => panel.mode = ContMode::List,
+                KeyCode::Up => *sel = sel.saturating_sub(1),
+                KeyCode::Down => {
+                    let len = visible
+                        .get(panel.sel)
+                        .and_then(|&i| panel.issues.get(i))
+                        .map(|i| i.refs.len());
+                    if let Some(len) = len
+                        && *sel + 1 < len
+                    {
+                        *sel += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(&i) = visible.get(panel.sel)
+                        && let Some(r) = panel.issues[i].refs.get(*sel).cloned()
+                    {
+                        // Opening moves focus to the editor; the panel is
+                        // dropped by not storing it back.
+                        self.open_doc(core, r.rel);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            self.continuity_panel = Some(panel);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Tree;
+                self.status = "continuity closed".into();
+                return;
+            }
+            KeyCode::Up => panel.sel = panel.sel.saturating_sub(1),
+            KeyCode::Down => {
+                if panel.sel + 1 < visible.len() {
+                    panel.sel += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(&i) = visible.get(panel.sel) {
+                    let issue = &panel.issues[i];
+                    if issue.refs.is_empty() {
+                        self.status =
+                            "this issue has no references — it names its document already".into();
+                    } else {
+                        panel.mode = ContMode::Refs { sel: 0 };
+                    }
+                }
+            }
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                let Some(&i) = visible.get(panel.sel) else {
+                    self.continuity_panel = Some(panel);
+                    return;
+                };
+                let issue = panel.issues[i].clone();
+                let now_ignored = !panel.ignored.contains(&issue.id);
+                match oca_story::set_ignored(core, &issue.id, now_ignored) {
+                    Ok(_) => {
+                        if now_ignored {
+                            panel.ignored.insert(issue.id.clone());
+                            self.status =
+                                format!("ignored \"{}\" — a shows ignored issues", issue.id);
+                        } else {
+                            panel.ignored.remove(&issue.id);
+                            self.status = format!("\"{}\" is back on the list", issue.id);
+                        }
+                        Self::clamp_continuity_sel(&mut panel);
+                    }
+                    Err(e) => self.status = format!("not recorded: {e:#}"),
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(&i) = visible.get(panel.sel) {
+                    let issue = panel.issues[i].clone();
+                    match oca_story::note_for(core, &issue) {
+                        Ok(rel) => {
+                            self.status = format!(
+                                "note appended to {} — open it from the tree",
+                                rel.display()
+                            );
+                        }
+                        Err(e) => self.status = format!("no note written: {e:#}"),
+                    }
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                panel.show_ignored = !panel.show_ignored;
+                Self::clamp_continuity_sel(&mut panel);
+                self.status = if panel.show_ignored {
+                    "showing ignored issues too".into()
+                } else {
+                    "ignored issues hidden".into()
+                };
+            }
+            _ => {}
+        }
+        self.continuity_panel = Some(panel);
+    }
+
+    /// Centered popup: the severity-sorted issue list, then the reference
+    /// view behind Enter (`[View references]` from the roadmap).
+    fn draw_continuity(&self, frame: &mut Frame) {
+        let Some(panel) = &self.continuity_panel else {
+            return;
+        };
+        let visible = Self::visible_issues(panel);
+        match &panel.mode {
+            ContMode::List => {
+                let area = centered(frame.area(), 90, 18);
+                let title = format!(
+                    " Continuity — {} issue(s){} ",
+                    visible.len(),
+                    if panel.show_ignored {
+                        ", including ignored"
+                    } else {
+                        ""
+                    }
+                );
+                let block = Block::default().borders(Borders::ALL).title(title);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let mut lines = Vec::new();
+                if visible.is_empty() {
+                    lines.push(Line::styled(
+                        "no issues found — the story lines up so far",
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                for (row, &i) in visible.iter().enumerate() {
+                    let issue = &panel.issues[i];
+                    let ignored = panel.ignored.contains(&issue.id);
+                    let marker = if row == panel.sel { "▶ " } else { "  " };
+                    let color = match issue.severity {
+                        oca_story::Severity::Error => Color::Red,
+                        oca_story::Severity::Warning => Color::Yellow,
+                        oca_story::Severity::Info => Color::Cyan,
+                    };
+                    let mut line = Line::from(vec![
+                        Span::styled(
+                            format!("{marker}{:<5}", issue.severity.label()),
+                            Style::new().fg(color),
+                        ),
+                        Span::raw(issue.message.clone()),
+                    ]);
+                    if ignored {
+                        line = line.style(Style::new().fg(Color::DarkGray));
+                        line.push_span(Span::styled(
+                            " (ignored)",
+                            Style::new().fg(Color::DarkGray),
+                        ));
+                    } else if row == panel.sel {
+                        line = line.style(SELECTED_STYLE);
+                    }
+                    lines.push(line);
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    "↑↓ select · Enter view references · i ignore/unignore · n note · a ignored · Esc close",
+                    Style::new().fg(Color::DarkGray),
+                ));
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            }
+            ContMode::Refs { sel } => {
+                let area = centered(frame.area(), 90, 16);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Continuity — references ");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let mut lines = Vec::new();
+                if let Some(issue) = visible.get(panel.sel).map(|&i| &panel.issues[i]) {
+                    lines.push(Line::from(issue.message.clone()));
+                    if !issue.query.is_empty() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::styled(
+                            format!(
+                                "search \"{}\" in the project for supporting passages (Ctrl-F)",
+                                issue.query
+                            ),
+                            Style::new().fg(Color::DarkGray),
+                        ));
+                    }
+                    lines.push(Line::from(""));
+                    for (n, r) in issue.refs.iter().enumerate() {
+                        let marker = if n == *sel { "▶ " } else { "  " };
+                        let mut line =
+                            Line::from(format!("{marker}{}  ({})", r.title, r.rel.display()));
+                        if n == *sel {
+                            line = line.style(SELECTED_STYLE);
+                        }
+                        lines.push(line);
+                    }
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    "↑↓ select · Enter open · Esc back",
+                    Style::new().fg(Color::DarkGray),
+                ));
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            }
+        }
+    }
+
     pub fn tick(&mut self, core: &mut Core) -> Result<()> {
         self.journal_now(core, false);
         self.poll_ai(core);
@@ -2179,6 +2480,7 @@ impl App {
             Focus::Snapshots => self.snap_key(core, key),
             Focus::Ai => self.ai_key(core, key),
             Focus::Proposals => self.proposal_key(core, key),
+            Focus::Continuity => self.continuity_key(core, key),
         }
         Ok(())
     }
@@ -2236,6 +2538,7 @@ impl App {
             KeyCode::Char('v') | KeyCode::Char('V') => self.open_snap_panel(core),
             KeyCode::Char('i') | KeyCode::Char('I') => self.open_ai_panel(),
             KeyCode::Char('p') | KeyCode::Char('P') => self.open_proposal_panel(core),
+            KeyCode::Char('c') | KeyCode::Char('C') => self.open_continuity_panel(core),
             KeyCode::Tab if self.open_rel.is_some() => {
                 self.focus = Focus::Editor;
             }
@@ -2335,6 +2638,7 @@ impl App {
         self.draw_snapshots(frame);
         self.draw_ai(frame);
         self.draw_proposals(frame);
+        self.draw_continuity(frame);
     }
 
     fn draw_tree(&self, frame: &mut Frame, area: Rect) {
@@ -2979,7 +3283,7 @@ impl App {
                 " Tab/ Esc tree · Ctrl-F search · Ctrl-S save · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Tree => {
-                " ↑↓ select · Enter open · S state · A audio · V snapshots · I AI · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
+                " ↑↓ select · Enter open · S state · A audio · V snapshots · I AI · P proposals · C continuity · Ctrl-F search · Tab editor · Ctrl-N chapter · Ctrl-Q quit"
             }
             Focus::Form => " Tab field · Enter apply · Esc cancel",
             Focus::Audio => {
@@ -2995,6 +3299,9 @@ impl App {
             }
             Focus::Proposals => {
                 " ↑↓ select · Enter review · a accept · r reject · e edit · Esc close"
+            }
+            Focus::Continuity => {
+                " ↑↓ select · Enter refs · i ignore · n note · a ignored · Esc close"
             }
         };
         let line2 = Line::from(Span::styled(hints, Style::new().fg(Color::DarkGray)));
@@ -5007,5 +5314,89 @@ the harbor locks its own back door
             panel.error
         );
         assert_eq!(core.proposals().unwrap().len(), 0, "nothing recorded");
+    }
+
+    /// Phase 12, TUI half: the continuity panel lists a seeded issue,
+    /// triage writes go through `oca-story` (ignore → `.oca/state/`, note →
+    /// `notes/continuity.md`), and Enter in the references view opens the
+    /// document the issue points at. All detection is engine-side (rule 8).
+    #[test]
+    fn continuity_panel_lists_triages_and_opens_references() {
+        let tmp = TempDir::new().unwrap();
+        let (mut core, _chapter) = project_with_chapter(&tmp);
+        core.execute(Command::SaveDocument {
+            doc: PathBuf::from("characters/elena.md"),
+            raw: "---\nid: elena\ntitle: Elena\nname: Elena\nstates:\n  - at: ch_missing\n    \
+                  location: nowhere\n---\n\n# Elena\n"
+                .into(),
+        })
+        .unwrap();
+        let mut app = App::new(&core, Arc::new(MockHost::new()));
+
+        // `C` in the tree opens the panel with the seeded issue on top.
+        app.on_key(&mut core, key(KeyCode::Char('c'))).unwrap();
+        assert_eq!(app.focus, Focus::Continuity, "status: {:?}", app.status);
+        {
+            let panel = app.continuity_panel.as_ref().expect("continuity open");
+            assert!(matches!(panel.mode, ContMode::List));
+            assert!(
+                panel
+                    .issues
+                    .iter()
+                    .any(|i| i.check == "character/unknown-state-chapter"),
+                "seeded issue found: {:?}",
+                panel.issues.iter().map(|i| &i.id).collect::<Vec<_>>()
+            );
+            assert!(!panel.show_ignored);
+        }
+
+        // Enter opens the references view; Esc returns to the list.
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            app.continuity_panel.as_ref().unwrap().mode,
+            ContMode::Refs { .. }
+        ));
+        app.on_key(&mut core, key(KeyCode::Esc)).unwrap();
+        assert!(matches!(
+            app.continuity_panel.as_ref().unwrap().mode,
+            ContMode::List
+        ));
+
+        // `i` records the ignore decision in `.oca/state/` (rule 2) and
+        // hides the issue; `a` brings ignored issues back.
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        {
+            let panel = app.continuity_panel.as_ref().unwrap();
+            assert_eq!(panel.ignored.len(), 1, "panel knows the decision");
+        }
+        assert!(
+            tmp.path()
+                .join(".oca/state/continuity/ignored.txt")
+                .is_file(),
+            "the decision is precious state, not cache"
+        );
+        app.on_key(&mut core, key(KeyCode::Char('a'))).unwrap();
+        assert!(app.continuity_panel.as_ref().unwrap().show_ignored);
+        app.on_key(&mut core, key(KeyCode::Char('i'))).unwrap();
+        assert!(
+            app.continuity_panel.as_ref().unwrap().ignored.is_empty(),
+            "second i lifts the decision"
+        );
+
+        // `n` appends the issue to the continuity note through the Core.
+        app.on_key(&mut core, key(KeyCode::Char('n'))).unwrap();
+        let note = std::fs::read_to_string(tmp.path().join("notes/continuity.md")).unwrap();
+        assert!(note.contains("ch_missing"), "issue recorded: {note}");
+
+        // Enter on a reference opens the document it points at (here the
+        // character file the issue names).
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        app.on_key(&mut core, key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.focus, Focus::Editor, "opening moves to the editor");
+        assert_eq!(
+            app.open_rel.as_deref(),
+            Some(Path::new("characters/elena.md"))
+        );
+        assert!(app.continuity_panel.is_none(), "panel dropped on open");
     }
 }

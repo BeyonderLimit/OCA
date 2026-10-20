@@ -1675,6 +1675,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "oca-core",
+ "oca-markdown",
  "oca-model",
  "oca-storage",
  "serde_yaml",

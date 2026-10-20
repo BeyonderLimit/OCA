@@ -4,10 +4,10 @@ Local-first creative workspace for stories, music, and audio, with optional
 offline AI. Everything lives in plain Markdown and YAML on your disk; OCA
 indexes, analyzes, and safety-nets it — it never sends a byte anywhere.
 
-**Status: Phases 0–11 implemented locally** (workspace, story engine, song
+**Status: Phases 0–12 implemented locally** (workspace, story engine, song
 analysis, audio takes, search, snapshots, offline AI with proposals, dictation,
-RAG/hybrid search). CI verification pending. See `AGENTS.md` for the phase
-ledger and `OCA-roadmap.md` for what's next.
+RAG/hybrid search, story continuity checks). CI verification pending. See
+`AGENTS.md` for the phase ledger and `OCA-roadmap.md` for what's next.
 
 Three rules shape everything:
 

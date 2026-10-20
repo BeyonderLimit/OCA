@@ -628,6 +628,20 @@ pub enum StoryCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+
+    /// Continuity check — deterministic contradiction and drift reports.
+    /// Reports only: nothing is ever written (triage happens in the TUI).
+    Check {
+        /// Also show issues you have ignored.
+        #[arg(long)]
+        all: bool,
+        /// Skip retrieval passages — print the report without them.
+        #[arg(long)]
+        no_passages: bool,
+        /// Project directory (default: the project in the cwd).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

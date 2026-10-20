@@ -13,10 +13,13 @@
 mod fixtures;
 mod graders;
 
-pub use fixtures::{CHAPTER_TWO_SCENES, SONG_TWO_SECTIONS, song_project, story_project};
+pub use fixtures::{
+    CHAPTER_TWO_SCENES, CONTINUITY_SEEDS, SONG_TWO_SECTIONS, continuity_project, song_project,
+    story_project,
+};
 pub use graders::{
-    Grade, Grader, NonEmpty, PreservesHook, PreservesNamedEntities, PreservesRhymeScheme,
-    SchemaValidity, SummaryLength,
+    ContinuityDetection, Grade, Grader, NonEmpty, PreservesHook, PreservesNamedEntities,
+    PreservesRhymeScheme, SchemaValidity, SummaryLength,
 };
 
 use anyhow::Result;

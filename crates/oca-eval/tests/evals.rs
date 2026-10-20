@@ -2,6 +2,7 @@
 //! graded deterministically. No LLM-as-judge, no real model: the same
 //! grades come out on any machine (A8, AGENTS "AI evals").
 
+use std::path::Path;
 use std::sync::Arc;
 
 use oca_ai::{
@@ -11,9 +12,11 @@ use oca_ai::{
 };
 use oca_core::Command;
 use oca_eval::{
-    CHAPTER_TWO_SCENES, Grader, NonEmpty, PreservesNamedEntities, SchemaValidity, SummaryLength,
-    character_names, story_project,
+    CHAPTER_TWO_SCENES, CONTINUITY_SEEDS, ContinuityDetection, Grader, NonEmpty,
+    PreservesNamedEntities, SchemaValidity, SummaryLength, character_names, continuity_project,
+    story_project,
 };
+use oca_story::{check, render};
 use tempfile::TempDir;
 
 fn mock_ai() -> Ai {
@@ -168,4 +171,52 @@ fn evals_fail_a_model_that_answers_prose_to_a_schema() {
     }
     .grade(&raw_generation(&ai, &prepared.request));
     assert!(!grade.passed, "{grade}");
+}
+
+/// Every file under `root`, sorted — for proving a detector never wrote.
+fn snapshot_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                out.push((
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Phase 12 exit criteria: the seeded contradictions are detected with
+/// their planted severities and references, no false HIGH on the clean
+/// surroundings, byte-identical output across runs — and not one byte of
+/// the project changes (reports only, zero silent fixes).
+#[test]
+fn eval_continuity_detects_seeded_contradictions() {
+    let tmp = TempDir::new().unwrap();
+    let core = continuity_project(tmp.path()).unwrap();
+
+    let before = snapshot_bytes(tmp.path());
+    let report = render(&check(&core).unwrap());
+    assert_eq!(
+        before,
+        snapshot_bytes(tmp.path()),
+        "the detector must never write — reports only"
+    );
+
+    let grade = ContinuityDetection {
+        seeds: CONTINUITY_SEEDS,
+    }
+    .grade(&report);
+    assert!(grade.passed, "{grade}\n--- report ---\n{report}");
+
+    // Deterministic: the same project, the same report.
+    assert_eq!(report, render(&check(&core).unwrap()));
 }

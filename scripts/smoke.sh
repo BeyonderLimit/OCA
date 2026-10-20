@@ -12,8 +12,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== phase gate: only this phase's crates exist =="
 # No big-bang scaffolding: crates are created when their phase arrives
-# (crate → phase table, OCA-implementation.md §2). Phases 0–11 = these +
-# CLI (7B dictation adds no crate; 9 adds oca-eval; 11 adds oca-rag).
+# (crate → phase table, OCA-implementation.md §2). Phases 0–12 = these +
+# CLI (7B dictation and 12 continuity add no crate; 9 adds oca-eval;
+# 11 adds oca-rag).
 allowed="oca-ai oca-audio oca-cli oca-core oca-eval oca-markdown oca-model oca-music oca-rag oca-storage oca-story oca-tui oca-versioning"
 for dir in crates/*/; do
     name=$(basename "$dir")

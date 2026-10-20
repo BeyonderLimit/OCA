@@ -1768,3 +1768,100 @@ fn phase11_embeddings_without_an_llm_degrade_honestly() {
         "degraded, not hybrid: {stdout}"
     );
 }
+
+/// Phase 12 exit, CLI half: the deterministic continuity report over the
+/// sample novel with one planted contradiction — right severities, real
+/// references, exit 0 and empty stderr (reports only, never a failure), a
+/// planted ignore honored and revealed by `--all`, and the whole report
+/// complete with no AI configured at all (rule 3); the scripted mock
+/// embedder only adds corroborating passages on top.
+#[test]
+fn phase12_story_check_reports_severity_refs_and_honors_ignores() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = sample_novel(&home);
+
+    // Plant two contradictions: a state keyed at a "deleted" chapter and a
+    // relationship with nobody.
+    std::fs::write(
+        root.join("characters/ghost-hunter.md"),
+        "---\nid: gh_hunter\ntitle: Ghost Hunter\nname: Ghost Hunter\n\
+         relationships:\n  nobody:\n    type: distrust\n\
+         states:\n  - at: ch_nope\n    location: courthouse\n---\n\n# Ghost Hunter\n",
+    )
+    .unwrap();
+
+    // No AI configured whatsoever: the report is still complete (rule 3).
+    let out = run_in(&home, tmp.path(), &root, &["story", "check"]);
+    let stdout = stdout_of(&out);
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "a report never fails");
+    assert!(stdout.contains("continuity — 2 high"), "got: {stdout}");
+    assert!(
+        stdout.contains("HIGH  character/unknown-state-chapter"),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("HIGH  relationship/target-missing"),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("refs: characters/ghost-hunter.md"),
+        "every planted error names a document: {stdout}"
+    );
+
+    // Ignore one issue: hidden by default, visible (and marked) with --all.
+    std::fs::create_dir_all(root.join(".oca/state/continuity")).unwrap();
+    std::fs::write(
+        root.join(".oca/state/continuity/ignored.txt"),
+        "# my decision\ncharacter/unknown-state-chapter|gh_hunter|ch_nope\n",
+    )
+    .unwrap();
+    let stdout = stdout_of(&run_in(&home, tmp.path(), &root, &["story", "check"]));
+    assert!(
+        !stdout.contains("HIGH  character/unknown-state-chapter"),
+        "ignored stays hidden: {stdout}"
+    );
+    assert!(
+        stdout.contains("HIGH  relationship/target-missing"),
+        "the un-ignored error remains: {stdout}"
+    );
+    assert!(stdout.contains("1 ignored"), "footer says so: {stdout}");
+
+    let all = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["story", "check", "--all"],
+    ));
+    assert!(
+        all.contains("HIGH  character/unknown-state-chapter"),
+        "--all reveals it: {all}"
+    );
+    assert!(all.contains("(ignored)"), "and marks it: {all}");
+
+    // The scripted mock embedder adds corroborating passages — additive,
+    // never required. `--all` keeps the ignored issue in play: its query
+    // ("Elena") is guaranteed to hit the novel's chapters.
+    write_ai_config(&home, "[ai]\nmock = true\n");
+    let with_passages = stdout_of(&run_in(
+        &home,
+        tmp.path(),
+        &root,
+        &["story", "check", "--all"],
+    ));
+    assert!(
+        with_passages.contains("passage:"),
+        "mock embeddings corroborate: {with_passages}"
+    );
+    assert!(
+        with_passages.contains("HIGH  relationship/target-missing")
+            && with_passages.contains("HIGH  character/unknown-state-chapter"),
+        "the report itself is unchanged: {with_passages}"
+    );
+}

@@ -242,6 +242,68 @@ impl Grader for PreservesRhymeScheme {
     }
 }
 
+/// The continuity detector's report — the canonical `SEVERITY\tid\trefs\t
+/// message` lines `oca_story::render` produces — graded against the
+/// planted contradictions: every seed must appear with its severity and
+/// (for HIGH) at least one reference, and no HIGH may appear that wasn't
+/// planted. Reports-only is graded by the test (fixture bytes compared
+/// before and after), not here.
+#[derive(Clone, Debug)]
+pub struct ContinuityDetection {
+    /// `(issue id, severity label)` — what was planted where.
+    pub seeds: &'static [(&'static str, &'static str)],
+}
+
+impl Grader for ContinuityDetection {
+    fn name(&self) -> &'static str {
+        "continuity-detection"
+    }
+    fn grade(&self, output: &str) -> Grade {
+        // (severity, id, refs) per line; the message field is ignored.
+        let mut rows: Vec<(&str, &str, &str)> = Vec::new();
+        for line in output.lines().filter(|l| !l.trim().is_empty()) {
+            let mut parts = line.splitn(4, '\t');
+            let (Some(sev), Some(id), Some(refs)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return verdict(self.name(), false, format!("unparseable line: {line:?}"));
+            };
+            rows.push((sev, id, refs));
+        }
+
+        let mut problems = Vec::new();
+        for (id, sev) in self.seeds {
+            match rows.iter().find(|(_, i, _)| *i == *id) {
+                None => problems.push(format!("missed {id}")),
+                Some((got, _, _)) if *got != *sev => {
+                    problems.push(format!("{id} reported {got}, want {sev}"));
+                }
+                Some((_, _, refs)) if *sev == "HIGH" && refs.trim().is_empty() => {
+                    problems.push(format!("{id} has no reference document"));
+                }
+                Some(_) => {}
+            }
+        }
+        for (sev, id, _) in &rows {
+            if *sev == "HIGH" && !self.seeds.iter().any(|(i, s)| *s == "HIGH" && i == id) {
+                problems.push(format!("false HIGH: {id}"));
+            }
+        }
+
+        verdict(
+            self.name(),
+            problems.is_empty(),
+            if problems.is_empty() {
+                format!(
+                    "all {} seeds detected with planted severities, no false HIGH",
+                    self.seeds.len()
+                )
+            } else {
+                problems.join("; ")
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +406,53 @@ mod tests {
         }
         .grade("anything at all\nwith two lines");
         assert!(!vacuous.passed, "{vacuous}");
+    }
+
+    #[test]
+    fn continuity_grader_demands_seeds_severity_refs_and_quiet_highs() {
+        let seeds: &[(&str, &str)] = &[("a/one|x", "HIGH"), ("b/two|y", "WARN")];
+        let grader = ContinuityDetection { seeds };
+
+        // The happy report: both seeds, planted severities, a ref on HIGH.
+        let ok = "HIGH\ta/one|x\tcharacters/elena.md\tbroken\nWARN\tb/two|y\t\tdrift\n";
+        assert!(grader.grade(ok).passed, "{}", grader.grade(ok));
+
+        let missed = grader.grade("HIGH\ta/one|x\tcharacters/elena.md\tbroken\n");
+        assert!(
+            !missed.passed && missed.detail.contains("b/two|y"),
+            "{missed}"
+        );
+
+        let wrong =
+            grader.grade("WARN\ta/one|x\tcharacters/elena.md\tbroken\nWARN\tb/two|y\t\tdrift\n");
+        assert!(
+            !wrong.passed && wrong.detail.contains("want HIGH"),
+            "{wrong}"
+        );
+
+        let noref = grader.grade("HIGH\ta/one|x\t\tbroken\nWARN\tb/two|y\t\tdrift\n");
+        assert!(
+            !noref.passed && noref.detail.contains("reference"),
+            "{noref}"
+        );
+
+        // Crying wolf on clean surroundings fails the grade.
+        let false_high = grader.grade(
+            "HIGH\ta/one|x\tcharacters/elena.md\tbroken\nWARN\tb/two|y\t\tdrift\n\
+             HIGH\tc/three|z\t\tspooky\n",
+        );
+        assert!(
+            !false_high.passed && false_high.detail.contains("false HIGH: c/three|z"),
+            "{false_high}"
+        );
+
+        // Garbage fails honestly instead of passing vacuously.
+        let junk = grader.grade("not a report");
+        assert!(
+            !junk.passed && junk.detail.contains("unparseable"),
+            "{junk}"
+        );
+        let empty = grader.grade("");
+        assert!(!empty.passed && empty.detail.contains("missed"), "{empty}");
     }
 }

@@ -11,11 +11,15 @@
 //! not resolved; `story_time` values are compared as strings, so keep one
 //! sortable scheme (ISO dates or zero-padded labels) per project.
 
+mod continuity;
 mod entity;
 mod mention;
 mod state;
 mod timeline;
 
+pub use continuity::{
+    Issue, IssueRef, Severity, check, ignored_ids, note_for, render, set_ignored,
+};
 pub use entity::{Character, Relationship};
 pub use mention::mentions;
 pub use state::{StateEntry, StateView, set_state};
@@ -30,12 +34,12 @@ use oca_core::Core;
 /// Manuscript + entity directories and the timeline file (A1 layout).
 const MANUSCRIPT_DIR: &str = "manuscript";
 const CHARACTERS_DIR: &str = "characters";
-const TIMELINE_REL: &str = "outline/timeline.md";
+pub(crate) const TIMELINE_REL: &str = "outline/timeline.md";
 
-/// Story queries over an open project (read side; [`set_state`] is the one
-/// mutation).
+/// Story queries over an open project (read side; [`set_state`] is one
+/// mutation, [`continuity`] the other surface).
 pub struct Story<'c> {
-    core: &'c Core,
+    pub(crate) core: &'c Core,
 }
 
 /// One manuscript chapter in narrative order.
