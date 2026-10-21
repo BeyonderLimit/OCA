@@ -27,6 +27,9 @@ cargo build --release          # -> target/release/oca
 scripts/smoke.sh               # the full local gate: fmt + clippy + tests + binaries
 ```
 
+For from-scratch setup (toolchain prerequisites, `cargo install`, first
+project, troubleshooting), see `INSTALL.md`.
+
 Requirements: a recent stable Rust toolchain. Linux, macOS, and Windows are
 supported; audio capture needs a working input device, everything else does
 not.
@@ -97,6 +100,40 @@ oca search tag:character:elena # tag lookup
 oca import ~/research/harbor-code.md   # Markdown / text / EPUB -> library/ with provenance
 oca reindex                    # rebuild the cache; also syncs embeddings when installed
 ```
+
+## The TUI
+
+Everything above is also one workspace: `oca open` (a project name from
+`oca list`, or a path) opens the terminal UI — project tree, editor, and
+panels around the same Core the CLI uses. It holds no business logic;
+every key it handles calls the same API the commands do.
+
+```
+┌ tree ──┬──────────── editor ────────────┐
+│        │                                │
+└────────┴──────────── status bar ────────┘
+```
+
+Global keys: `Tab`/`Esc` move between tree and editor · `Ctrl-N` new
+chapter · `Ctrl-F` search (hybrid when an embedding model is installed) ·
+`Ctrl-S` save · `Ctrl-Q` quit. The mouse works — click a tree entry to
+open it, click into the editor to type.
+
+Panels, opened from the tree (each closes with `Esc`):
+
+| Key | Panel |
+| --- | --- |
+| `S` | Set a character's state at the open chapter (lossless frontmatter write) |
+| `A` | Audio takes — record/pause/save, play, attach, delete; dictation: `t` transcribe, `i` insert into the editor, `n` append to notes, `c`/`p` LLM cleanup previews (only when an LLM is installed) |
+| `V` | Snapshots — save now, inline diff, restore (exact bytes back) |
+| `I` | AI model — load/unload, probe stream, and the story ops (continue/rewrite/summarize/outline/review) or music ops depending on the open document |
+| `P` | AI proposals — side-by-side current-draft/proposed review, accept/reject/edit |
+| `C` | Continuity — severity-sorted issue list, references view, ignore/note triage |
+
+Song files get `Alt-]`/`Alt-[` section jumps and live syllable counts in
+the editor title. Unsaved work is journaled as you type — a crash offers
+the draft back on reopen; never more than a couple of seconds lost.
+
 
 ## Optional AI (all offline)
 
